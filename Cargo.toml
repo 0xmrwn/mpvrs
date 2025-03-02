@@ -2,6 +2,20 @@
 name = "neatflix-mpvrs"
 version = "0.1.0"
 edition = "2021"
+description = "A Rust video player using mpv"
+authors = ["0xmrwn <niches-anode0k@icloud.com>"]
+license = "MIT"
+
+[lib]
+name = "neatflix_mpvrs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "neatflix-mpvrs"
+path = "src/main.rs"
 
 [dependencies]
 libmpv = "2"
+log = "0.4"
+env_logger = "0.10"
+thiserror = "1.0"

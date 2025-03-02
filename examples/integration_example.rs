@@ -1,6 +1,5 @@
 use log::{error, info};
 use neatflix_mpvrs::{config, setup_logging};
-use std::env;
 use std::process::Command;
 
 fn check_mpv_installed() -> bool {
@@ -13,7 +12,7 @@ fn check_mpv_installed() -> bool {
 fn main() {
     // Initialize logging
     setup_logging();
-    info!("neatflix-mpvrs v{}", neatflix_mpvrs::version());
+    info!("neatflix-mpvrs integration example v{}", neatflix_mpvrs::version());
     
     // Check if mpv is installed
     if !check_mpv_installed() {
@@ -29,26 +28,15 @@ fn main() {
         std::process::exit(1);
     }
     
-    // Get media file from command line arguments or use a default
-    let args: Vec<String> = env::args().collect();
-    let media = if args.len() > 1 {
-        &args[1]
-    } else {
-        println!("Usage: neatflix-mpvrs <media_file_or_url>");
-        println!("No media file specified. Please provide a media file path or URL.");
-        std::process::exit(1);
-    };
+    // Example media file or URL - replace with your own file
+    let media = "https://upload.wikimedia.org/wikipedia/commons/transcoded/f/f1/Sintel_movie_4K.webm/Sintel_movie_4K.webm.1080p.vp9.webm";
     
     // Optional extra arguments to override defaults
-    let extra_args: Vec<&str> = if args.len() > 2 {
-        args[2..].iter().map(|s| s.as_str()).collect()
-    } else {
-        vec![]
-    };
-    
-    info!("Playing media: {}", media);
+    let extra_args = ["--volume=70", "--fullscreen"];
+
+    info!("Playing demo media: {}", media);
     if let Err(e) = neatflix_mpvrs::spawn_mpv(media, &extra_args) {
         error!("Error launching video player: {}", e);
         std::process::exit(1);
     }
-}
+} 

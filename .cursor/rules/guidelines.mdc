@@ -1,236 +1,238 @@
 ---
-description: 
+description: Overall project guidelines
 globs: 
 alwaysApply: true
 ---
-Below is a draft guide outlining a complete solution. In this draft, placeholders and “to‐do” notes are included where you may need to confirm details or refine the approach. You’ll be able to do a second pass later to fill in any missing details.
+Below is the refined, comprehensive guide for building a macOS‑focused Rust video player crate that uses mpv (via libmpv‑rs) and a custom Lua OSC. This crate is designed as a standalone library that spawns mpv in its own window (using mpv’s default window), loads a custom configuration for stability (with overrides allowed), and handles playback controls entirely within mpv via the Lua OSC theme. Integration (for example, with a Tauri app) will be done separately by calling this crate’s public API.
 
 ---
 
-# Detailed Guide for Building an mpv-Based Video Player with Custom Lua OSC for Tauri V2
+# Comprehensive Guide for Building a macOS Video Player Crate Using mpv and libmpv‑rs
 
-This guide explains how to build a cross-platform video player that runs in its own native window using mpv. The player is designed as a separate Rust-based module/repository that can be integrated with a Tauri V2 application. It features playback of local files and HTTP streams, audio track and subtitle selection, progress reporting, and a pre-configured Lua OSC theme (using mpv-osc-tethys as a starting point) to achieve a “Netflix-like” interface.
+## 1. Overview
 
-> **Note:** Some parts are placeholders with instructions for further research. In a later pass, you should replace these with verified configurations and code.
+This guide describes how to build a modular, cross‑platform (macOS‑first) video player in Rust. The player leverages mpv’s robust playback engine through libmpv‑rs, and it uses a customized Lua OSC (based on mpv‑osc‑tethys) to deliver a “Netflix‑like” interface for playback controls. For v1, the focus is on macOS using the installed mpv binary (development mode), with plans to add Windows and Linux support later, including options for static linking.
 
 ---
 
-## 1. Repository & Project Structure
+## 2. Objectives
 
-### 1.1. Create a Separate Repository
-It is recommended to implement the video player as its own repository. This separation allows for:
-- **Modular Development:** The player’s code, configuration, and assets (Lua theme, etc.) are isolated.
-- **Reusability:** You can later integrate the player into your Tauri app or even other projects.
-- **Testing & Packaging:** Easier cross-platform packaging and independent testing.
+- **Modular Development:**  
+  Develop the video player as a standalone library crate with a clean API for launching media playback, applying configuration overrides, and handling progress reporting if needed.
+  
+- **macOS‑First Target:**  
+  Initially target macOS. The design will allow adding support for Windows and Linux in future versions.
 
-### 1.2. Suggested Repository Structure
+- **mpv Integration:**  
+  Use mpv’s built‑in window (no custom windowing library) to simplify development and later integrate the player within a Tauri webview if desired.
+
+- **Playback Controls:**  
+  Rely entirely on mpv’s Lua OSC (customized from mpv‑osc‑tethys) for playback control (play/pause, seek, volume, etc.), removing the need for native control implementations.
+
+- **Stable Configuration:**  
+  Load a dedicated mpv configuration file for stability while still allowing user or external overrides.
+
+- **Logging & Debugging:**  
+  Implement logging and debugging using common-sense approaches (for example, using Rust’s logging ecosystem) to track errors and playback events.
+
+- **Dependency Management:**  
+  For development, rely on the installed mpv version. Future iterations will consider static linking options.
+
+---
+
+## 3. Repository & Project Structure
+
+Structure the repository as a standalone Git library crate. This approach ensures the video player logic, assets, and configuration remain isolated and easily integrable ints.
+
+### 3.1. Recommended Folder Structure
 
 ```
 mpv-video-player/
-├── Cargo.toml                  # Workspace/Cargo configuration
-├── README.md                   # Project overview and build instructions
+├── Cargo.toml                  # Library crate configuration
+├── README.md                   # Project overview, build instructions, and usage notes
 ├── src/
-│   ├── lib.rs                  # Library exposing core functionality
+│   ├── lib.rs                  # Public API exposing core functionality
 │   ├── player.rs               # Module for spawning and controlling mpv
-│   └── ipc.rs                  # (Optional) IPC handling for reporting progress
+│   └── config.rs               # Module for managing mpv configuration and overrides
 ├── assets/
 │   ├── lua/
-│   │   └── osc-tethys.lua      # Pre-configured OSC theme (modified as needed)
-│   └── mpv_config.toml         # (Optional) Additional mpv configuration defaults
+│   │   └── osc-tethys.lua      # Custom OSC Lua script (modified for a Netflix‑like UI)
+│   └── mpv_config.toml         # Default mpv configuration file for stability
 └── examples/
-    └── integration_example.rs  # Example usage for testing standalone functionality
+    └── integration_example.rs  # Example usage demonstrating how to call the crate’s API
 ```
 
-*Tip:* Consider setting up a Cargo workspace if you plan to include additional crates later (for example, one for Tauri integration and one for the player logic).
+*Note:* The structure can be extended (or wrapped in a Cargo workspace) if additional related crates are added later.
 
 ---
 
-## 2. Implementation Considerations
+## 4. Implementation Details
 
-### 2.1. Spawning mpv in a Separate Native Window
+### 4.1. Spawning mpv with the Custom Lua OSC
 
-- **Process Spawning:**  
-  Use Rust’s standard library (or crates such as [`std::process`](https://doc.rust-lang.org/std/process/)) to launch the mpv executable with required command-line options.  
-  **Key Options:**
-  - `--osc=yes` (enable OSC)  
-  - `--no-input-default-bindings` (if you want to disable mpv’s built-in key bindings)  
-  - `--wid=<window_id>` is _not needed_ if mpv is running in its own window, but you might add additional window options (e.g., borderless, always on top) if desired.
+Since mpv will be launched as a separate process in its own window, use Rust’s process spawning facilities. The player will pass a custom Lua OSC script and load a dedicated configuration file.
+
+#### Example Code Snippet:
+
+```rust
+use std::process::Command;
+use std::path::PathBuf;
+use std::io;
+
+/// Spawns mpv with the specified media file or URL.
+/// Additional command-line arguments can override default configurations.
+pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> io::Result<()> {
+    // Build the argument list with key options:
+    // - Enable the OSC for controls.
+    // - Load the custom Lua OSC script.
+    // - Load the dedicated mpv configuration file.
+    let mut args = vec![
+        "--osc=yes",
+        &format!("--script={}", get_lua_theme_path().to_string_lossy()),
+        &format!("--config={}", get_mpv_config_path().to_string_lossy()),
+    ];
+    args.extend_from_slice(extra_args);
+    args.push(file_or_url);
+
+    // Spawn mpv asynchronously. For development, rely on the system-installed mpv.
+    Command::new("mpv")
+        .args(&args)
+        .spawn()?;
+    Ok(())
+}
+
+/// Returns the path to the custom Lua OSC theme.
+fn get_lua_theme_path() -> PathBuf {
+    PathBuf::from("assets/lua/osc-tethys.lua")
+}
+
+/// Returns the path to the dedicated mpv configuration file.
+fn get_mpv_config_path() -> PathBuf {
+    PathBuf::from("assets/mpv_config.toml")
+}
+```
+
+> **Note:** The option `--config=` is assumed to load a configuration file. Verify the correct mpv command‑line parameter in the latest mpv documentation and adjust as needed.
+
+---
+
+### 4.2. MPV Configuration & Overrides
+
+Load a dedicated configuration file to ensure stable playback. Users or integrators can supply additional command‑line arguments (`extra_args`) to override defaults. The `assets/mpv_config.toml` file should include settings that promote stability and performance on macOS.
+
+Example `mpv_config.toml` (contents to be tailored based on best practices):
+
+```toml
+# Example mpv configuration for stability
+vo=opengl
+hwdec=auto
+audio-channels=stereo
+# Additional options as needed...
+```
+
+*Tip:* Update and refine the configuration file based on testing and user feedback.
+
+---
+
+### 4.3. Custom Lua OSC for Playback Controls
+
+The video player relies on mpv’s Lua OSC for all playback control functionalities. Customize the `osc-tethys.lua` script to achieve a modern, minimalistic interface similar to Netflix’s controls. Place the modified script in `assets/lua/`.
+
+*Reminder:* Validate and test your Lua OSC customizations against current mpv versions and ensure they load correctly via the command‑line option.
+
+---
+
+### 4.4. Logging & Debugging
+
+Implces (for example, via the [`log`](https://crates.io/crates/log) crate and a logger implementation such as [`env_logger`](https://crates.io/crates/env_logger)). Log errors when spawning mpv, configuration load failures, and other runtime events.
+
+#### Example Logging Setup:
+
+```rust
+use log::{info, error};
+
+fn setup_logging() {
+    env_logger::init();
+}
+
+// Use logging in your functions:
+pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> std::io::Result<()> {
+    info!("Launching mpv for media: {}", file_or_url);
+    // ... (spawn process)
+    // Log errors, if any:
+    // error!("Failed to launch mpv: {}", e);
+    Ok(())
+}
+```
+
+*Note:* Adjust the logging verbosity as needed during development and production.
+
+---
+
+### 4.5. Dependency Management
+
+- **Development:**  
+  For v1, the crate assumes that mpv is installed on the target macOS system. Ensure that developers have mpv available in their PATH.
   
-- **Custom Lua OSC Theme:**  
-  Configure mpv to load your OSC Lua script (for example, using mpv-osc-tethys) by ensuring it’s in mpv’s script directory or by passing the appropriate `--script=` option.  
-  Example snippet:
-  ```rust
-  use std::process::Command;
+- **Future Iterations:**  
+  In later versions, consider options for static linking via libmpv‑rs or bundling the mpv binary with the application.
 
-  fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> std::io::Result<()> {
-      // Build the argument list
-      let mut args = vec![
-          "--osc=yes",
-          "--script=",
-          // Placeholder: specify the full path to your lua OSC theme
-          &format!("--script={}", get_lua_theme_path().to_string_lossy()),
-      ];
-      args.extend_from_slice(extra_args);
-      args.push(file_or_url);
+---
 
-      // Spawn mpv; consider using spawn() to run asynchronously.
-      Command::new("mpv")
-          .args(&args)
-          .spawn()?;
-      Ok(())
-  }
+## 5. Packaging & Distribution
 
-  // Placeholder function – implement resource lookup for the theme asset.
-  fn get_lua_theme_path() -> std::path::PathBuf {
-      // For example, load from a bundled resource directory.
-      std::path::PathBuf::from("assets/lua/osc-tethys.lua")
-  }
-  ```
-  > **Placeholder:** Confirm the correct mpv command-line option for loading Lua scripts. Search for “mpv load lua script command line” for details if needed.
+### 5.1. Crate Packaging
 
-### 2.2. Feature Support Implementation
-
-- **Local Files & HTTP Streams:**  
-  Pass the file path or URL directly to mpv. mpv natively supports a wide range of formats and protocols (local files, HLS, DASH, etc.).
-
-- **Audio Track & Subtitle Selection:**  
-  - **Audio Track:**  
-    Expose commands (or use IPC) that call mpv’s property change commands (e.g., `set_property("aid", <track_id>)`).
-  - **Subtitles:**  
-    Similarly, call `set_property("sid", <subtitle_id>)` or load subtitles via `load_subtitles`.
-  > **Tip:** If using JSON IPC (via `--input-ipc-server`), search for “mpv JSON IPC audio track subtitle selection” for concrete examples.
+- **Library Crate:**  
+  The video player is packaged as a library crate that exposes a minimal API (e.g., a `spawn_mpv` function). External applications (such as a Tauri app) can call this API to launch and control playback.
   
-- **Progress Reporting:**  
-  Implement a mechanism (either polling or via mpv events) to report playback progress back to your Tauri application. For example:
-  - Poll the property `time-pos` every 500ms.
-  - Emit events through Tauri’s command system (this integration point will be used by your Tauri front-end later).
-  ```rust
-  use std::thread;
-  use std::time::Duration;
-  // Pseudo-code for polling:
-  fn start_progress_polling() {
-      thread::spawn(|| {
-          loop {
-              // Placeholder: Call function get_time_position() via IPC or libmpv
-              let current_time = get_time_position();
-              // Placeholder: Emit event to Tauri front-end, e.g., via a channel or Tauri API.
-              emit_progress_event(current_time);
-              thread::sleep(Duration::from_millis(500));
-          }
-      });
-  }
-  ```
-  > **Placeholder:** Implement `get_time_position()` and `emit_progress_event()` as needed. Research “mpv get_property time-pos Rust” and “Tauri emit event from Rust” for details.
+- **Asset Bundling:**  
+  Ensure that the `assets/` directory (containing the Lua OSC script and configuration file) is included in the final package. Update your `.gitignore` and packaging scripts accordingly.
 
-### 2.3. Packaging & Cross-Platform Bundling
+### 5.2. Integration Example
 
-- **Bundling mpv Binary & Assets:**  
-  You can bundle the mpv binary and your Lua theme files as extra resources. In Tauri V2:
-  - Define extra assets in your `tauri.conf.json` (or TOML) under the `bundle.resources` key.
-  - At runtime, use Tauri’s resource API (e.g., [`tauri::api::path::resource_dir`](https://tauri.app/v2/api/js/path/)) to locate these assets.
-  > **Placeholder:** Verify the exact configuration keys in the latest Tauri V2 docs by searching for “Tauri V2 bundle resources” if details change.
+In the `examples/integration_example.rs`, provide a minimal example of how to call the public API:
 
-- **Cross-Platform Considerations:**  
-  - **Windows:** Bundle `mpv-1.dll` (or equivalent) if needed, or instruct users to install mpv.
-  - **macOS:** Bundle the appropriate `libmpv.dylib` and any other dependencies.
-  - **Linux:** Ensure that the package either depends on system-installed mpv or bundles a portable version.
-  > **Research Tip:** Look up “Tauri cross platform bundling mpv” and “packaging native binaries with Tauri” for updated best practices.
+```rust
+fn main() {
+    // Initialize logging
+    mpv_video_player::setup_logging();
 
-### 2.4. Tauri Integration
+    // Example media file or URL
+    let media = "path/to/media/file.mp4";
+    
+    // Optional extra arguments to override defaults
+    let extra_args = ["--volume=50"];
 
-- **Exposing Tauri Commands:**  
-  In your video player module, expose functions as Tauri commands so that your front-end (React/TypeScript) can:
-  - Launch the video player (e.g., pass file path/URL, resume time).
-  - Send commands (e.g., change audio/subtitle tracks).
-  - Receive progress events.
-  
-  Example in Rust (using Tauri’s command attribute):
-  ```rust
-  #[tauri::command]
-  pub fn play_video(path: String, resume_time: Option<f64>) -> Result<(), String> {
-      // Spawn mpv with the given path and optionally seek to resume_time.
-      // Placeholder: Call spawn_mpv() with appropriate arguments.
-      spawn_mpv(&path, &[]).map_err(|e| e.to_string())?;
-      // If resume_time is provided, send a command to mpv to seek.
-      if let Some(time) = resume_time {
-          // Placeholder: Implement seek functionality via IPC or property change.
-          set_time_position(time)?;
-      }
-      Ok(())
-  }
-  ```
-  > **Placeholder:** Fill in implementations for `set_time_position()` based on your chosen IPC or libmpv integration.
+    if let Err(e) = mpv_video_player::spawn_mpv(media, &extra_args) {
+        eprintln!("Error launching video player: {}", e);
+    }
+}
+```
 
-- **Event Communication:**  
-  Use Tauri’s event system to notify the front-end of progress updates or important events (like video end). Research “Tauri emit event Rust” for up-to-date examples.
+Compile and run this example to verify that mpv launches correctly with the custom Lua OSC and configuration.
 
 ---
 
-## 3. Step-by-Step Development Roadmap
+## 6. Conclusion
 
-1. **Repository Setup:**
-   - Create a new Git repository (e.g., `mpv-video-player`).
-   - Initialize a new Cargo project and set up the folder structure.
-   - Add necessary dependencies in `Cargo.toml` (e.g., any Rust bindings for mpv, Tauri dependencies if testing commands locally).
+This guide has detailed the design and implementation of a macOS‑focused video player crate in Rust that uses mpv and libmpv‑rs. The key highlights include:
 
-2. **Core Video Player Module:**
-   - Implement process spawning logic to launch mpv with the correct command-line options.
-   - Create functions to control playback (play, pause, seek, audio/subtitle selection).
-   - Implement progress polling and reporting.
+- **Standalone Library Crate:**  
+  A modular repository structure that isolates playback logic and assets.
 
-3. **Lua OSC Theme Integration:**
-   - Obtain and customize the mpv-osc-tethys Lua script to achieve a Netflix-like UI.
-   - Place the Lua script under the `assets/lua/` directory.
-   - Test that mpv loads the theme correctly when launched with your command-line options.
+- **mpv Integration:**  
+  Spawning mpv with a custom Lua OSC for a modern UI and loading a dedicated configuration for stability.
 
-4. **Tauri Integration Layer:**
-   - Create Tauri commands in your Rust module to expose the video player functionality.
-   - Write integration tests or a minimal Tauri front-end that calls these commands.
-   - Ensure progress events are correctly emitted and can be received by your front-end.
+- **Platform Focus:**  
+  macOS is the primary target for v1, with future plans to add Windows and Linux support.
 
-5. **Packaging & Cross-Platform Testing:**
-   - Configure your Tauri bundler to include the mpv binary (or instruct users to install it) and the assets folder.
-   - Test the packaged application on all target platforms (Windows, macOS, Linux).
-   - Adjust configurations as necessary based on platform-specific behavior.
+- **Simplified Controls:**  
+  Playback controls are entirely handled by mpv through the Lua OSC, reducing the need for native UI controls.
 
-6. **Documentation & Finalization:**
-   - Document the repository structure, build instructions, and usage in your README.
-   - List any platform-specific requirements or additional steps.
-   - Prepare a changelog and roadmap for future enhancements.
+- **Flexible Configuration & Logging:**  
+  The design allows for configuration overrides and employs standard logging for debugging.
+
+By following this comprehensive guide, you will have a robust and maintainable video player crate that can later be integrated into broader applications (such as a Tauri app) using its well‑defined API.
 
 ---
-
-## 4. Additional Research & Placeholders
-
-Where more information is needed, leave placeholders with the following instructions:
-
-- **mpv Command-Line Options:**  
-  If uncertain about options for controlling audio/subtitle tracks, search for “mpv command-line audio track selection” and “mpv load_subtitles command-line” in the mpv manual or forums.
-
-- **Tauri Bundling:**  
-  Verify the current best practices for bundling extra resources with Tauri V2 by searching “Tauri V2 bundle extra resources” in the official Tauri documentation.
-
-- **IPC Implementation:**  
-  Decide whether to use mpv’s JSON IPC (via `--input-ipc-server`) or a Rust binding to `libmpv`. If using JSON IPC, search for “mpv JSON IPC Rust example” for implementation details.
-
-- **Lua OSC Customization:**  
-  For customizing the OSC theme, review the [mpv-osc-tethys GitHub repository](https://github.com/Zren/mpv-osc-tethys) and search for “mpv OSC customization lua” to find additional resources and community examples.
-
----
-
-## 5. Conclusion
-
-By following this guide, you will create a modular, cross-platform video player that leverages mpv’s powerful playback engine and a custom Lua OSC for a Netflix-like UI. The player is built as a separate repository, making it easier to integrate with your Tauri V2 application. This separation, combined with clear Tauri command and event interfaces, ensures a smooth integration and a maintainable codebase.
-
-> **Next Steps:**  
-> – Validate each placeholder by consulting the official mpv, Tauri, and relevant Rust documentation.  
-> – Test each component separately (player module, Lua theme, Tauri commands) before integrating into the final packaged app.
-
----
-
-**Citations:**  
-citeturn0search5 (mpv-osc-tethys example)  
-citeturn0search8 (native window compositing discussion)  
-citeturn0search9 (customizing mpv OSC via Lua)
-
-This draft guide should provide a comprehensive starting point. In the next pass, you can refine each section with verified commands, code snippets, and updated Tauri configuration details.
