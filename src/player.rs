@@ -72,7 +72,7 @@ fn validate_config_file(file_path: &PathBuf) -> Result<()> {
 
 /// Spawns mpv with the specified media file or URL.
 /// Additional command-line arguments can override default configurations.
-pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> Result<()> {
+pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> crate::Result<()> {
     info!("Launching mpv for media: {}", file_or_url);
     
     // Validate configuration files before launching mpv
@@ -121,7 +121,72 @@ pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> Result<()> {
         }
         Err(e) => {
             error!("Failed to launch mpv: {}", e);
-            Err(Error::Io(e))
+            Err(crate::Error::Io(e))
+        }
+    }
+}
+
+/// Spawns mpv with the specified media file or URL and a preset.
+/// The preset will override default configurations, and extra_args can override preset settings.
+pub fn spawn_mpv_with_preset(file_or_url: &str, preset_name: Option<&str>, extra_args: &[&str]) -> crate::Result<()> {
+    info!("Launching mpv for media: {} with preset: {:?}", file_or_url, preset_name);
+    
+    // Validate configuration files before launching mpv
+    if let Err(e) = validate_config_files() {
+        warn!("Error validating config files: {}. Continuing anyway...", e);
+    }
+
+    // Create String values that will live for the entire function
+    let config_dir_path = get_mpv_config_path();
+    let config_dir_str = config_dir_path.to_str().unwrap().to_string();
+    debug!("MPV config directory: {}", config_dir_str);
+    
+    // Build args using mpv's --option=value format
+    let mut args = Vec::<String>::new();
+    
+    // Add verbose flag to see script loading errors
+    args.push("--msg-level=all=v".to_string());
+    
+    // Add configuration directory
+    args.push(format!("--config-dir={}", config_dir_str));
+    
+    // Ensure uosc is used instead of the standard OSC
+    args.push("--osc=no".to_string());
+    args.push("--osd-bar=no".to_string());
+    args.push("--border=no".to_string());
+    
+    // If a preset is specified, add its configuration options
+    if let Some(preset_name) = preset_name {
+        match crate::presets::apply_preset(preset_name) {
+            Ok(preset_args) => {
+                debug!("Applying preset '{}' with args: {:?}", preset_name, preset_args);
+                args.extend(preset_args);
+            },
+            Err(e) => {
+                warn!("Failed to apply preset '{}': {}. Continuing with default settings.", preset_name, e);
+            }
+        }
+    }
+    
+    // Add any extra arguments (these will override preset settings)
+    for arg in extra_args {
+        args.push(arg.to_string());
+    }
+    
+    // Add the file or URL
+    args.push(file_or_url.to_string());
+
+    debug!("MPV arguments: {:?}", args);
+
+    // Spawn mpv asynchronously. For development, rely on the system-installed mpv.
+    match Command::new("mpv").args(&args).spawn() {
+        Ok(child) => {
+            debug!("MPV process spawned with PID: {:?}", child.id());
+            Ok(())
+        }
+        Err(e) => {
+            error!("Failed to launch mpv: {}", e);
+            Err(crate::Error::Io(e))
         }
     }
 }
