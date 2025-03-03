@@ -216,7 +216,7 @@ fn create_macos_high_quality_preset() -> PresetConfig {
     // Higher quality scaling options
     config_options.insert("scale".to_string(), "ewa_lanczossharp".to_string());
     config_options.insert("dscale".to_string(), "ewa_lanczos".to_string());
-    config_options.insert("cscale".to_string(), "ewa_lanczossoft".to_string());
+    config_options.insert("cscale".to_string(), "ewa_lanczos".to_string());
     
     // Advanced rendering options
     config_options.insert("gpu-dumb-mode".to_string(), "no".to_string());
