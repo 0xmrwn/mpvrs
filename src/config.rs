@@ -15,9 +15,7 @@ pub fn ensure_config_dir() -> Result<PathBuf> {
 
 /// Returns the path to the dedicated mpv configuration directory.
 pub fn get_mpv_config_path() -> PathBuf {
-    let mut path = crate::get_assets_path();
-    path.push("mpv_config");
-    path
+    crate::get_assets_path()
 }
 
 /// Initializes the default mpv configuration

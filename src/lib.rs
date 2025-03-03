@@ -32,10 +32,10 @@ pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> Result<()> {
     player::spawn_mpv(file_or_url, extra_args)
 }
 
-/// Returns the path to the assets directory
+/// Returns the path to the mpv_config directory
 pub fn get_assets_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("assets");
+    path.push("mpv_config");
     path
 }
 

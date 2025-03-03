@@ -10,7 +10,6 @@ use std::process::Command;
 fn validate_config_files() -> Result<()> {
     let script_opts_dir = {
         let mut path = crate::get_assets_path();
-        path.push("mpv_config");
         path.push("script-opts");
         path
     };
@@ -129,7 +128,5 @@ pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> Result<()> {
 
 /// Returns the path to the dedicated mpv configuration directory.
 fn get_mpv_config_path() -> PathBuf {
-    let mut path = crate::get_assets_path();
-    path.push("mpv_config");
-    path
+    crate::get_assets_path()
 } 
