@@ -24,9 +24,7 @@ function TopBar:init()
 	end
 
 	local close = {icon = 'close', hover_bg = '2311e8', hover_fg = 'ffffff', command = function() mp.command('quit') end}
-	local max = {icon = 'crop_square', command = maximized_command}
-	local min = {icon = 'minimize', command = function() mp.command('cycle window-minimized') end}
-	self.buttons = options.top_bar_controls == 'left' and {close, max, min} or {min, max, close}
+	self.buttons = options.top_bar_controls == 'left' and {close} or {close}
 
 	self:decide_titles()
 	self:decide_enabled()
