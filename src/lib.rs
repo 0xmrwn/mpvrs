@@ -7,6 +7,7 @@ use thiserror::Error;
 pub mod config;
 mod player;
 pub mod presets;
+pub mod plugin;
 
 /// Error type for the neatflix-mpvrs library
 #[derive(Error, Debug)]
@@ -83,4 +84,7 @@ pub use player::events::{MpvEvent, MpvEventListener};
 /// Creates a new event listener for the specified IPC client.
 pub fn create_event_listener(ipc_client: player::ipc::MpvIpcClient) -> player::events::MpvEventListener {
     player::events::MpvEventListener::new(ipc_client)
-} 
+}
+
+// Re-export plugin API
+pub use plugin::{VideoManager, VideoId, PlaybackOptions, VideoEvent, EventSubscription}; 
