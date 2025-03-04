@@ -944,4 +944,9 @@ impl MpvIpcClient {
         self.intentionally_closed = true;
         self.connected = false;
     }
+    
+    /// Returns the configured poll interval in milliseconds
+    pub fn get_poll_interval(&self) -> u64 {
+        self.config.poll_interval_ms
+    }
 } 

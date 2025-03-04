@@ -7,7 +7,7 @@ use std::fs;
 pub const DEFAULT_IPC_TIMEOUT_MS: u64 = 5000;
 
 /// Default polling interval for IPC events in milliseconds
-pub const DEFAULT_IPC_POLL_INTERVAL_MS: u64 = 100;
+pub const DEFAULT_IPC_POLL_INTERVAL_MS: u64 = 1000;
 
 /// Default maximum number of reconnection attempts
 pub const DEFAULT_MAX_RECONNECT_ATTEMPTS: u32 = 5;

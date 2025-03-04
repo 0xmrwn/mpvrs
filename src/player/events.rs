@@ -173,7 +173,7 @@ impl MpvEventListener {
                     let should_attempt_reconnect = {
                         let mut last_attempt = last_reconnect_attempt.lock().unwrap();
                         if let Some(time) = *last_attempt {
-                            if time.elapsed() > Duration::from_secs(2) {
+                            if time.elapsed() > Duration::from_secs(5) {
                                 *last_attempt = Some(Instant::now());
                                 true
                             } else {
@@ -200,8 +200,12 @@ impl MpvEventListener {
                 // Poll for events if connected
                 Self::poll_events(&ipc_client, &callbacks, &property_observers);
                 
-                // Sleep for a short time to avoid hammering the socket
-                thread::sleep(Duration::from_millis(100));
+                // Use the configured poll interval instead of hardcoded value
+                let poll_interval = {
+                    let client = ipc_client.lock().unwrap();
+                    client.get_poll_interval()
+                };
+                thread::sleep(Duration::from_millis(poll_interval));
             }
             
             debug!("Event polling thread stopped");
@@ -295,13 +299,25 @@ impl MpvEventListener {
             }
         };
         
-        // Update playback position and related properties
-        Self::update_playback_properties(&mut ipc_client, callbacks);
+        // Track when the last position update was sent
+        static mut LAST_POSITION_UPDATE: Option<Instant> = None;
         
-        // Check for end of file
+        // Check if we need to update position (every 3 seconds)
+        let should_update_position = unsafe {
+            match LAST_POSITION_UPDATE {
+                None => true,
+                Some(last_time) => last_time.elapsed() >= Duration::from_secs(3)
+            }
+        };
+        
+        // Only update playback position occasionally
+        if should_update_position {
+            unsafe { LAST_POSITION_UPDATE = Some(Instant::now()) };
+            Self::update_playback_properties(&mut ipc_client, callbacks);
+        }
+        
+        // Always check for critical events
         Self::check_eof(&mut ipc_client, callbacks);
-        
-        // Check for other events like pause changes, volume changes, etc.
         Self::check_state_changes(&mut ipc_client, callbacks);
     }
     
@@ -310,16 +326,40 @@ impl MpvEventListener {
         ipc_client: &mut MpvIpcClient,
         callbacks: &Arc<Mutex<HashMap<String, Vec<EventCallback>>>>,
     ) {
+        // Track the last reported positions to avoid sending too many updates
+        static mut LAST_TIME_POS: Option<f64> = None;
+        static mut LAST_PERCENT_POS: Option<f64> = None;
+        
         // Get the current playback position
         if let Ok(time_pos) = ipc_client.get_time_pos() {
-            // Notify time-pos subscribers
-            Self::notify_callbacks(callbacks, "time-pos", &MpvEvent::TimePositionChanged(time_pos));
+            // Only notify if position changed by at least 5 seconds
+            let should_notify = unsafe {
+                match LAST_TIME_POS {
+                    None => true,
+                    Some(last_pos) => (time_pos - last_pos).abs() >= 5.0
+                }
+            };
+            
+            if should_notify {
+                unsafe { LAST_TIME_POS = Some(time_pos) };
+                Self::notify_callbacks(callbacks, "time-pos", &MpvEvent::TimePositionChanged(time_pos));
+            }
         }
         
         // Get the current percentage position
         if let Ok(percent_pos) = ipc_client.get_percent_pos() {
-            // Notify percent-pos subscribers
-            Self::notify_callbacks(callbacks, "percent-pos", &MpvEvent::PercentPositionChanged(percent_pos));
+            // Only notify if position changed by at least 1%
+            let should_notify = unsafe {
+                match LAST_PERCENT_POS {
+                    None => true,
+                    Some(last_pos) => (percent_pos - last_pos).abs() >= 1.0
+                }
+            };
+            
+            if should_notify {
+                unsafe { LAST_PERCENT_POS = Some(percent_pos) };
+                Self::notify_callbacks(callbacks, "percent-pos", &MpvEvent::PercentPositionChanged(percent_pos));
+            }
         }
     }
     
