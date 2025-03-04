@@ -1,7 +1,9 @@
 use log::{error, info};
-use neatflix_mpvrs::{config, setup_logging};
+use neatflix_mpvrs::{config, setup_logging, MpvEvent};
 use std::env;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 fn check_mpv_installed() -> bool {
     match Command::new("which").arg("mpv").output() {
@@ -63,6 +65,7 @@ fn main() {
     // Check if a preset is specified
     let mut preset_name = None;
     let mut extra_args = Vec::new();
+    let mut enable_ipc_control = false;
     
     for arg in args.iter().skip(2) {
         if arg.starts_with("--preset=") {
@@ -73,6 +76,8 @@ fn main() {
             let recommended = neatflix_mpvrs::get_recommended_preset();
             preset_name = Some(recommended);
             info!("Using recommended preset: {}", preset_name.as_ref().unwrap());
+        } else if arg == "--ipc-control" {
+            enable_ipc_control = true;
         } else {
             extra_args.push(arg.as_str());
         }
@@ -88,8 +93,67 @@ fn main() {
         neatflix_mpvrs::spawn_mpv(media, &extra_args)
     };
     
-    if let Err(e) = result {
-        error!("Error launching video player: {}", e);
-        std::process::exit(1);
+    // Handle the result and set up IPC if requested
+    match result {
+        Ok((process, socket_path)) => {
+            info!("MPV process spawned with PID: {:?}", process.id());
+            
+            if enable_ipc_control {
+                info!("IPC control enabled, socket path: {}", socket_path);
+                
+                // Give mpv some time to start up
+                thread::sleep(Duration::from_secs(1));
+                
+                // Connect to the IPC socket
+                match neatflix_mpvrs::connect_ipc(&socket_path) {
+                    Ok(ipc_client) => {
+                        info!("Connected to MPV IPC socket");
+                        
+                        // Create an event listener
+                        let mut event_listener = neatflix_mpvrs::create_event_listener(ipc_client);
+                        
+                        // Subscribe to time position changes
+                        if let Err(e) = event_listener.subscribe("property:time-pos", |event| {
+                            if let MpvEvent::PropertyChanged(property, value) = &event {
+                                info!("Playback position: {} = {:?}", property, value);
+                            }
+                        }) {
+                            error!("Error subscribing to time position events: {}", e);
+                        }
+                        
+                        // Subscribe to playback state changes
+                        if let Err(e) = event_listener.subscribe("property:pause", |event| {
+                            match event {
+                                MpvEvent::PlaybackPaused => info!("Playback paused"),
+                                MpvEvent::PlaybackResumed => info!("Playback resumed"),
+                                _ => {}
+                            }
+                        }) {
+                            error!("Error subscribing to pause events: {}", e);
+                        }
+                        
+                        // Start listening for events
+                        if let Err(e) = event_listener.start_listening() {
+                            error!("Error starting event listener: {}", e);
+                        } else {
+                            info!("Event listener started");
+                            
+                            // Wait for the process to exit
+                            let _ = process.wait_with_output();
+                        }
+                    },
+                    Err(e) => {
+                        error!("Error connecting to mpv IPC: {}", e);
+                    }
+                }
+            } else {
+                // Just wait for the process to exit
+                let _ = process.wait_with_output();
+            }
+        },
+        Err(e) => {
+            error!("Error launching video player: {}", e);
+            std::process::exit(1);
+        }
     }
 }

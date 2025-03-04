@@ -3,7 +3,8 @@ use log::{debug, error, info, warn};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command};
+use uuid::Uuid;
 
 /// Validates configuration files to ensure they don't have common issues
 /// like trailing spaces after boolean values
@@ -70,9 +71,23 @@ fn validate_config_file(file_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Generates a unique socket path for IPC communication.
+pub fn generate_socket_path() -> String {
+    #[cfg(target_family = "unix")]
+    {
+        format!("/tmp/mpv-socket-{}", Uuid::new_v4())
+    }
+    
+    #[cfg(target_family = "windows")]
+    {
+        format!("\\\\.\\pipe\\mpv-socket-{}", Uuid::new_v4())
+    }
+}
+
 /// Spawns mpv with the specified media file or URL.
 /// Additional command-line arguments can override default configurations.
-pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> crate::Result<()> {
+/// Returns the process handle and socket path for IPC communication.
+pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> Result<(Child, String)> {
     info!("Launching mpv for media: {}", file_or_url);
     
     // Validate configuration files before launching mpv
@@ -80,9 +95,14 @@ pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> crate::Result<()> {
         warn!("Error validating config files: {}. Continuing anyway...", e);
     }
 
+    // Generate a unique socket path for IPC
+    let socket_path = generate_socket_path();
+    debug!("Generated IPC socket path: {}", socket_path);
+
     // Build the argument list with key options:
     // - Use uosc instead of standard OSC
     // - Use our custom config directory
+    // - Enable the JSON IPC server
     
     // Create String values that will live for the entire function
     let config_dir_path = get_mpv_config_path();
@@ -102,6 +122,9 @@ pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> crate::Result<()> {
     args.push("--osc=no".to_string());
     args.push("--osd-bar=no".to_string());
     args.push("--border=no".to_string());
+    
+    // Enable the JSON IPC server
+    args.push(format!("--input-ipc-server={}", socket_path));
     
     // Add any extra arguments
     for arg in extra_args {
@@ -117,24 +140,29 @@ pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> crate::Result<()> {
     match Command::new("mpv").args(&args).spawn() {
         Ok(child) => {
             debug!("MPV process spawned with PID: {:?}", child.id());
-            Ok(())
+            Ok((child, socket_path))
         }
         Err(e) => {
             error!("Failed to launch mpv: {}", e);
-            Err(crate::Error::Io(e))
+            Err(Error::Io(e))
         }
     }
 }
 
 /// Spawns mpv with the specified media file or URL and a preset.
 /// The preset will override default configurations, and extra_args can override preset settings.
-pub fn spawn_mpv_with_preset(file_or_url: &str, preset_name: Option<&str>, extra_args: &[&str]) -> crate::Result<()> {
+/// Returns the process handle and socket path for IPC communication.
+pub fn spawn_mpv_with_preset(file_or_url: &str, preset_name: Option<&str>, extra_args: &[&str]) -> Result<(Child, String)> {
     info!("Launching mpv for media: {} with preset: {:?}", file_or_url, preset_name);
     
     // Validate configuration files before launching mpv
     if let Err(e) = validate_config_files() {
         warn!("Error validating config files: {}. Continuing anyway...", e);
     }
+
+    // Generate a unique socket path for IPC
+    let socket_path = generate_socket_path();
+    debug!("Generated IPC socket path: {}", socket_path);
 
     // Create String values that will live for the entire function
     let config_dir_path = get_mpv_config_path();
@@ -154,6 +182,9 @@ pub fn spawn_mpv_with_preset(file_or_url: &str, preset_name: Option<&str>, extra
     args.push("--osc=no".to_string());
     args.push("--osd-bar=no".to_string());
     args.push("--border=no".to_string());
+    
+    // Enable the JSON IPC server
+    args.push(format!("--input-ipc-server={}", socket_path));
     
     // If a preset is specified, add its configuration options
     if let Some(preset_name) = preset_name {
@@ -182,11 +213,11 @@ pub fn spawn_mpv_with_preset(file_or_url: &str, preset_name: Option<&str>, extra
     match Command::new("mpv").args(&args).spawn() {
         Ok(child) => {
             debug!("MPV process spawned with PID: {:?}", child.id());
-            Ok(())
+            Ok((child, socket_path))
         }
         Err(e) => {
             error!("Failed to launch mpv: {}", e);
-            Err(crate::Error::Io(e))
+            Err(Error::Io(e))
         }
     }
 }
