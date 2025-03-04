@@ -228,6 +228,8 @@ fn get_mpv_config_path() -> PathBuf {
     crate::get_assets_path()
 }
 
+/// Monitors an mpv process and handles its exit
+#[allow(dead_code)]
 pub fn monitor_process(process: &mut Child, event_listener: &mut MpvEventListener) -> Result<i32> {
     debug!("Starting to monitor mpv process");
     

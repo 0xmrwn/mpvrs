@@ -411,29 +411,7 @@ impl MpvEventListener {
             }
         }
         
-        // Check volume
-        if let Ok(volume) = ipc_client.get_volume() {
-            static mut LAST_VOLUME: Option<f64> = None;
-            
-            let last_volume = unsafe { LAST_VOLUME };
-            
-            if last_volume != Some(volume) {
-                Self::notify_callbacks(callbacks, "volume", &MpvEvent::VolumeChanged(volume as i32));
-                unsafe { LAST_VOLUME = Some(volume); }
-            }
-        }
-        
-        // Check mute state
-        if let Ok(mute) = ipc_client.get_mute() {
-            static mut LAST_MUTE_STATE: Option<bool> = None;
-            
-            let last_state = unsafe { LAST_MUTE_STATE };
-            
-            if last_state != Some(mute) {
-                Self::notify_callbacks(callbacks, "mute", &MpvEvent::MuteChanged(mute));
-                unsafe { LAST_MUTE_STATE = Some(mute); }
-            }
-        }
+        // Volume and mute checks removed to reduce overhead
     }
     
     /// Notifies all registered callbacks for an event
