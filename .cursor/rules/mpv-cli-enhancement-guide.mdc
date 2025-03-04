@@ -1,0 +1,176 @@
+---
+description: Technical guide for enhancing mpv integration through CLI
+globs: 
+alwaysApply: true
+---
+
+## Technical Guide: Enhancing MPV Integration via CLI and JSON IPC in Rust
+### Overview
+Based on the analysis of the current neatflix-mpvrs codebase and the available mpv features, this guide outlines how to enhance the mpv integration by leveraging mpv's JSON IPC protocol alongside the existing CLI approach. This would allow for bidirectional communication with the mpv process after launching it, enabling features like real-time playback control and status updates.
+### 1. Understanding MPV's JSON IPC Protocol
+MPV provides a powerful JSON-based IPC (Inter-Process Communication) protocol that allows external programs to control the player and receive notifications about player state changes.
+#### Key Features of MPV's IPC Protocol
+- Commands: Send commands to control playback (play, pause, seek, etc.)
+- Properties: Get or set mpv properties (playback-time, pause, volume, etc.)
+- Events: Receive notifications when properties change or events occur
+- Observers: Subscribe to property changes to monitor playback state
+### 2. Architecture for Enhanced MPV Integration
+#### 2.1 Core Components
+1. Process Manager
+	- Responsible for spawning, monitoring, and terminating the mpv process
+	- Handles process lifecycle events
+2. IPC Client
+	- Manages socket connection to mpv
+	- Handles sending commands and receiving responses
+	- Implements message serialization/deserialization
+3. Event System
+	- Provides a clean abstraction for mpv events
+	- Allows subscription to events like playback progress, play/pause state changes, etc.
+4. Configuration Manager
+	- Extends the existing preset system to include IPC-specific configurations
+	- Manages socket paths and other IPC-related settings
+#### 2.2 Proposed Module Structure
+```neatflix-mpvrs/
+├── src/
+│   ├── player/
+│   │   ├── mod.rs               # Re-exports from submodules
+│   │   ├── process.rs           # Process management functions
+│   │   ├── ipc.rs               # IPC client implementation
+│   │   └── events.rs            # Event system
+│   ├── config/
+│   │   └── ipc.rs               # IPC-specific configurations
+│   └── presets/
+│       └── ipc_options.rs       # IPC options for presets
+```
+### 3. Safe Process Execution
+#### 3.1 Launching MPV with IPC Enabled
+The existing spawn_mpv function should be enhanced to:
+1. Generate a unique socket path for IPC communication
+2. Add the --input-ipc-server option to the mpv command line
+3. Store the process handle for lifecycle management
+4. Return a structure that includes both the process handle and socket path
+#### 3.2 Process Lifecycle Management
+Implement robust process management:
+- Monitor the process state (running, exited, crashed)
+- Implement clean termination procedures
+- Handle unexpected process exits
+- Properly clean up IPC sockets when the process terminates
+#### 3.3 Error Handling Considerations
+- Handle socket connection errors
+- Implement reconnection logic for temporary disconnections
+- Provide clear error types for process and IPC errors
+### 4. IPC Communication
+#### 4.1 Socket Connection
+Based on mpv-socket, implement socket connection logic:
+```// Conceptual code - not for implementation
+pub fn connect_ipc_socket(socket_path: &str) -> Result<MpvSocket, Error> {
+    // Platform-specific socket connection
+    #[cfg(target_family = "unix")]
+    {
+        // Connect to Unix domain socket
+    }
+    
+    #[cfg(target_family = "windows")]
+    {
+        // Connect to named pipe
+    }
+}
+```
+#### 4.2 Command Execution
+Implement functions to send commands to mpv:
+```// Conceptual code - not for implementation
+pub fn send_command(&mut self, command: &str, args: &[Value]) -> Result<Value, Error> {
+    // Send command to mpv via IPC
+    // Parse and return response
+}
+```
+#### 4.3 Property Observation
+Implement property observation for tracking playback state:
+```// Conceptual code - not for implementation
+pub fn observe_property(&mut self, property: &str) -> Result<PropertyObserver, Error> {
+    // Register observer for property
+    // Return observer that can be used to receive updates
+}
+```
+### 5. Event System
+#### 5.1 Event Types
+Define a comprehensive event system:
+```// Conceptual code - not for implementation
+pub enum MpvEvent {
+    // Playback state events
+    PlaybackStarted,
+    PlaybackPaused,
+    PlaybackResumed,
+    PlaybackCompleted,
+    
+    // Progress events
+    TimePositionChanged(f64),
+    PercentPositionChanged(f64),
+    
+    // Player state events
+    VolumeChanged(i32),
+    MuteChanged(bool),
+    
+    // Error events
+    PlaybackError(String),
+    
+    // Process events
+    ProcessExited(i32),
+}
+```
+#### 5.2 Event Subscription
+Implement a clean event subscription API:
+```// Conceptual code - not for implementation
+pub fn subscribe<F>(&mut self, event_type: MpvEventType, callback: F) 
+where F: FnMut(MpvEvent) + Send + 'static {
+    // Register callback for event type
+}
+```
+#### 5.3 Event Polling
+Implement an event polling mechanism:
+```// Conceptual code - not for implementation
+pub fn poll_events(&mut self) -> Vec<MpvEvent> {
+    // Poll for events from mpv
+    // Parse and return events
+}
+```
+### 6. Platform-Specific Considerations
+#### 6.1 Socket Paths
+- Unix (macOS/Linux): Use filesystem paths like /tmp/mpv-socket-{uuid}
+- Windows: Use named pipes like \\.\pipe\mpv-socket-{uuid}
+#### 6.2 Process Management
+- Unix: Use POSIX signals for process control
+- Windows: Use process handles and Windows API for process control
+### 7. Implementation Strategy
+#### 7.1 Phase 1: Core IPC Integration
+1. Implement basic process management with IPC socket setup
+2. Create a simple IPC client that can send commands and receive responses
+3. Implement property getters for basic playback information
+#### 7.2 Phase 2: Event System
+1. Implement property observers for tracking playback state
+2. Create event system for higher-level events
+3. Add subscription mechanism for event consumers
+#### 7.3 Phase 3: Enhanced Features
+1. Add advanced playback control (chapters, playlists, etc.)
+2. Implement robust error handling and reconnection logic
+3. Add additional mpv property support
+### 8. Tauri Integration Considerations
+To make this crate suitable for integration with Tauri v2:
+#### 8.1 Asynchronous API
+- Implement async versions of core functions using Rust's async/await
+- Use channels or streams for event delivery
+- Ensure thread-safety for concurrent access
+#### 8.2 Plugin Interface
+- Define a clean API that can be exposed via Tauri plugin
+- Use serializable types for plugin communication
+- Implement proper resource cleanup for plugin lifecycle
+#### 8.3 Error Handling
+- Use proper error types that can be serialized across plugin boundaries
+- Provide detailed error information for debugging
+- Implement recovery strategies where appropriate
+### Conclusion
+By implementing this enhanced mpv integration using the JSON IPC protocol, the neatflix-mpvrs crate can provide a much more interactive and feature-rich video playback experience. The IPC approach allows for real-time control and monitoring of the mpv process after it has been launched, enabling features like accurate playback progress tracking, play/pause control, and end-of-file detection.
+The design focuses on safety, efficiency, and maintainability, providing a clean API that can be easily integrated with applications like Tauri. By following this technical guide, the crate can evolve from a simple mpv launcher to a comprehensive video playback solution that leverages mpv's full capabilities through a Rust-friendly interface.
+### References
+- mpv-socket - Rust library for mpv's JSON-based IPC protocol
+- MPV JSON IPC Documentation

@@ -3,37 +3,40 @@ description: Overall project guidelines
 globs: 
 alwaysApply: true
 ---
-Below is the refined, comprehensive guide for building a macOS‑focused Rust video player crate that uses mpv (via libmpv‑rs) and a custom Lua OSC. This crate is designed as a standalone library that spawns mpv in its own window (using mpv’s default window), loads a custom configuration for stability (with overrides allowed), and handles playback controls entirely within mpv via the Lua OSC theme. Integration (for example, with a Tauri app) will be done separately by calling this crate’s public API.
+Below is the refined, comprehensive guide for building a macOS‑focused Rust video player crate that uses mpv via CLI and JSON IPC with a custom Lua OSC. This crate is designed as a standalone library that spawns mpv in its own window (using mpv's default window), loads a custom configuration for stability (with overrides allowed), and handles playback controls through both the Lua OSC theme and programmatic control via JSON IPC. Integration (for example, with a Tauri app) will be done separately by calling this crate's public API.
 
 ---
 
-# Comprehensive Guide for Building a macOS Video Player Crate Using mpv and libmpv‑rs
+# Comprehensive Guide for Building a macOS Video Player Crate Using mpv with CLI and JSON IPC
 
 ## 1. Overview
 
-This guide describes how to build a modular, cross‑platform (macOS‑first) video player in Rust. The player leverages mpv’s robust playback engine through libmpv‑rs, and it uses a customized Lua OSC (based on mpv‑osc‑tethys) to deliver a “Netflix‑like” interface for playback controls. For v1, the focus is on macOS using the installed mpv binary (development mode), with plans to add Windows and Linux support later, including options for static linking.
+This guide describes how to build a modular, cross‑platform (macOS‑first) video player in Rust. The player leverages mpv's robust playback engine through CLI and JSON IPC, and it uses a customized Lua OSC (based on mpv‑osc‑tethys) to deliver a "Netflix‑like" interface for playback controls. For v1, the focus is on macOS using the installed mpv binary (development mode), with plans to add Windows and Linux support later, including options for static linking.
 
 ---
 
 ## 2. Objectives
 
 - **Modular Development:**  
-  Develop the video player as a standalone library crate with a clean API for launching media playback, applying configuration overrides, and handling progress reporting if needed.
+  Develop the video player as a standalone library crate with a clean API for launching media playback, applying configuration overrides, and handling progress reporting through JSON IPC.
   
 - **macOS‑First Target:**  
   Initially target macOS. The design will allow adding support for Windows and Linux in future versions.
 
 - **mpv Integration:**  
-  Use mpv’s built‑in window (no custom windowing library) to simplify development and later integrate the player within a Tauri webview if desired.
+  Use mpv's built‑in window (no custom windowing library) to simplify development and later integrate the player within a Tauri webview if desired.
+
+- **Bidirectional Communication:**  
+  Implement JSON IPC for bidirectional communication with mpv, enabling real-time status updates and monitoring.
 
 - **Playback Controls:**  
-  Rely entirely on mpv’s Lua OSC (customized from mpv‑osc‑tethys) for playback control (play/pause, seek, volume, etc.), removing the need for native control implementations.
+  Provide dual control mechanisms: visual controls via mpv's Lua OSC and programmatic control via JSON IPC.
 
 - **Stable Configuration:**  
-  Load a dedicated mpv configuration file for stability while still allowing user or external overrides.
+  Load a dedicated mpv configurations and presets for stability while still allowing user or external overrides.
 
 - **Logging & Debugging:**  
-  Implement logging and debugging using common-sense approaches (for example, using Rust’s logging ecosystem) to track errors and playback events.
+  Implement logging and debugging using common-sense approaches (for example, using Rust's logging ecosystem) to track errors and playback events.
 
 - **Dependency Management:**  
   For development, rely on the installed mpv version. Future iterations will consider static linking options.
@@ -42,24 +45,34 @@ This guide describes how to build a modular, cross‑platform (macOS‑first) vi
 
 ## 3. Repository & Project Structure
 
-Structure the repository as a standalone Git library crate. This approach ensures the video player logic, assets, and configuration remain isolated and easily integrable ints.
+Structure the repository as a standalone Git library crate. This approach ensures the video player logic, assets, and configuration remain isolated and easily integrable.
 
 ### 3.1. Recommended Folder Structure
 
 ```
-mpv-video-player/
+neatflix-mpvrs/
 ├── Cargo.toml                  # Library crate configuration
 ├── README.md                   # Project overview, build instructions, and usage notes
 ├── src/
 │   ├── lib.rs                  # Public API exposing core functionality
-│   ├── player.rs               # Module for spawning and controlling mpv
-│   └── config.rs               # Module for managing mpv configuration and overrides
+│   ├── player/
+│   │   ├── mod.rs              # Re-exports from submodules
+│   │   ├── process.rs          # Process management functions
+│   │   ├── ipc.rs              # IPC client implementation
+│   │   └── events.rs           # Event system
+│   ├── config/
+│   │   ├── mod.rs              # Configuration management
+│   │   └── ipc.rs              # IPC-specific configurations
+│   └── presets/
+│       ├── mod.rs              # Preset management
+│       └── ipc_options.rs      # IPC options for presets
 ├── assets/
 │   ├── lua/
 │   │   └── osc-tethys.lua      # Custom OSC Lua script (modified for a Netflix‑like UI)
-│   └── mpv_config.toml         # Default mpv configuration file for stability
+│   └── mpv_config.conf         # Default mpv configuration file for stability
 └── examples/
-    └── integration_example.rs  # Example usage demonstrating how to call the crate’s API
+    ├── basic_playback.rs       # Simple playback example
+    └── ipc_control.rs          # Example demonstrating IPC control features
 ```
 
 *Note:* The structure can be extended (or wrapped in a Cargo workspace) if additional related crates are added later.
@@ -68,9 +81,9 @@ mpv-video-player/
 
 ## 4. Implementation Details
 
-### 4.1. Spawning mpv with the Custom Lua OSC
+### 4.1. Spawning mpv with CLI and JSON IPC
 
-Since mpv will be launched as a separate process in its own window, use Rust’s process spawning facilities. The player will pass a custom Lua OSC script and load a dedicated configuration file.
+Since mpv will be launched as a separate process in its own window, use Rust's process spawning facilities. The player will pass a custom Lua OSC script, load a dedicated configuration file, and enable the JSON IPC server.
 
 #### Example Code Snippet:
 
@@ -78,27 +91,47 @@ Since mpv will be launched as a separate process in its own window, use Rust’s
 use std::process::Command;
 use std::path::PathBuf;
 use std::io;
+use uuid::Uuid;
 
-/// Spawns mpv with the specified media file or URL.
-/// Additional command-line arguments can override default configurations.
-pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> io::Result<()> {
+/// Spawns mpv with the specified media file or URL and enables JSON IPC.
+/// Returns the process handle and socket path for IPC communication.
+pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> io::Result<(std::process::Child, String)> {
+    // Generate a unique socket path for IPC
+    let socket_path = generate_socket_path();
+    
     // Build the argument list with key options:
-    // - Enable the OSC for controls.
-    // - Load the custom Lua OSC script.
-    // - Load the dedicated mpv configuration file.
+    // - Enable the OSC for controls
+    // - Load the custom Lua OSC script
+    // - Load the dedicated mpv configuration file
+    // - Enable the JSON IPC server
     let mut args = vec![
         "--osc=yes",
         &format!("--script={}", get_lua_theme_path().to_string_lossy()),
-        &format!("--config={}", get_mpv_config_path().to_string_lossy()),
+        &format!("--include={}", get_mpv_config_path().to_string_lossy()),
+        &format!("--input-ipc-server={}", socket_path),
     ];
     args.extend_from_slice(extra_args);
     args.push(file_or_url);
 
     // Spawn mpv asynchronously. For development, rely on the system-installed mpv.
-    Command::new("mpv")
+    let process = Command::new("mpv")
         .args(&args)
         .spawn()?;
-    Ok(())
+        
+    Ok((process, socket_path))
+}
+
+/// Generates a unique socket path for IPC communication.
+fn generate_socket_path() -> String {
+    #[cfg(target_family = "unix")]
+    {
+        format!("/tmp/mpv-socket-{}", Uuid::new_v4())
+    }
+    
+    #[cfg(target_family = "windows")]
+    {
+        format!("\\\\.\\pipe\\mpv-socket-{}", Uuid::new_v4())
+    }
 }
 
 /// Returns the path to the custom Lua OSC theme.
@@ -108,60 +141,191 @@ fn get_lua_theme_path() -> PathBuf {
 
 /// Returns the path to the dedicated mpv configuration file.
 fn get_mpv_config_path() -> PathBuf {
-    PathBuf::from("assets/mpv_config.toml")
+    PathBuf::from("assets/mpv_config.conf")
 }
 ```
 
-> **Note:** The option `--config=` is assumed to load a configuration file. Verify the correct mpv command‑line parameter in the latest mpv documentation and adjust as needed.
+> **Note:** The option `--include=` is used to load a configuration file. The `--input-ipc-server=` option enables the JSON IPC s
 
 ---
 
-### 4.2. MPV Configuration & Overrides
+### 4.2. JSON IPC Communication
 
-Load a dedicated configuration file to ensure stable playback. Users or integrators can supply additional command‑line arguments (`extra_args`) to override defaults. The `assets/mpv_config.toml` file should include settings that promote stability and performance on macOS.
+Impnt for mpv's JSON IPC protocol to enable bidirectional communication with the mpv process.
 
-Example `mpv_config.toml` (contents to be tailored based on best practices):
+#### Example IPC Client Implementation:
 
-```toml
-# Example mpv configuration for stability
-vo=opengl
-hwdec=auto
-audio-channels=stereo
-# Additional options as needed...
+```rust
+use std::io::{Read, Write};
+use serde::{Serialize, Deserialize};
+use serde_json::{Value, json};
+
+#[cfg(target_family = "unix")]
+use std::os::unix::net::UnixStream;
+
+#[cfg(target_family = "windows")]
+use named_pipe::PipeClient;
+
+/// Client for communicating with mpv via JSON IPC.
+pub struct MpvIpcClient {
+    #[cfg(target_family = "unix")]
+    socket: UnixStream,
+    
+    #[cfg(target_family = "windows")]
+    socket: PipeClient,
+}
+
+impl MpvIpcClient {
+    /// Connects to the mpv JSON IPC socket.
+    pub fn connect(socket_path: &str) -> io::Result<Self> {
+        #[cfg(target_family = "unix")]
+        {
+            let socket = UnixStream::connect(socket_path)?;
+            Ok(Self { socket })
+        }
+        
+        #[cfg(target_family = "windows")]
+        {
+            let socket = PipeClient::connect(socket_path)?;
+            Ok(Self { socket })
+        }
+    }
+    
+    /// Sends a command to mpv.
+    pub fn command(&mut self, command: &str, args: &[Value]) -> io::Result<Value> {
+        let request = json!({
+            "command": [command, args],
+        });
+        
+        self.send_request(&request)?;
+        self.receive_response()
+    }
+    
+    /// Gets a property from mpv.
+    pub fn get_property(&mut self, property: &str) -> io::Result<Value> {
+        let request = json!({
+            "command": ["get_property", property],
+        });
+        
+        self.send_request(&request)?;
+        self.receive_response()
+    }
+    
+    /// Sets a property in mpv.
+    pub fn set_property(&mut self, property: &str, value: Value) -> io::Result<Value> {
+        let request = json!({
+            "command": ["set_property", property, value],
+        });
+        
+        self.send_request(&request)?;
+        self.receive_response()
+    }
+    
+    // Private helper methods for sending requests and receiving responses
+    // ...
+}
 ```
 
-*Tip:* Update and refine the configuration file based on testing and user feedback.
+---
+
+### 4.3. MPV Configuration & Overrides
+
+Load a dedicated configuration file to ensure stable playback. Users or integrators can supply additional command‑line arguments (`extra_args`) to override defaults. The `mpv_config/mpv_config.conf` file should include settings that promote stability and performance on macOS.
+
 
 ---
 
-### 4.3. Custom Lua OSC for Playback Controls
+### 4.4. Event System for Playback Monitoring
 
-The video player relies on mpv’s Lua OSC for all playback control functionalities. Customize the `osc-tethys.lua` script to achieve a modern, minimalistic interface similar to Netflix’s controls. Place the modified script in `assets/lua/`.
+Implement an event system to monitor playback state changes and other events from mpv.
 
-*Reminder:* Validate and test your Lua OSC customizations against current mpv versions and ensure they load correctly via the command‑line option.
+```rust
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+/// Types of events that can be emitted by mpv.
+pub enum MpvEvent {
+    // Playback state events
+    PlaybackStarted,
+    PlaybackPaused,
+    PlaybackResumed,
+    PlaybackCompleted,
+    
+    // Progress events
+    TimePositionChanged(f64),
+    PercentPositionChanged(f64),
+    
+    // Player state events
+    VolumeChanged(i32),
+    MuteChanged(bool),
+    
+    // Error events
+    PlaybackError(String),
+    
+    // Process events
+    ProcessExited(i32),
+}
+
+/// Event listener for mpv events.
+pub struct MpvEventListener {
+    ipc_client: Arc<Mutex<MpvIpcClient>>,
+    callbacks: HashMap<String, Vec<Box<dyn Fn(MpvEvent) + Send + 'static>>>,
+}
+
+impl MpvEventListener {
+    /// Creates a new event listener.
+    pub fn new(ipc_client: MpvIpcClient) -> Self {
+        Self {
+            ipc_client: Arc::new(Mutex::new(ipc_client)),
+            callbacks: HashMap::new(),
+        }
+    }
+    
+    /// Subscribes to an event.
+    pub fn subscribe<F>(&mut self, event_type: &str, callback: F)
+    where
+        F: Fn(MpvEvent) + Send + 'static,
+    {
+        let callbacks = self.callbacks.entry(event_type.to_string()).or_insert_with(Vec::new);
+        callbacks.push(Box::new(callback));
+    }
+    
+    /// Starts listening for events in a background thread.
+    pub fn start_listening(self) -> thread::JoinHandle<()> {
+        let ipc_client = Arc::clone(&self.ipc_client);
+        let callbacks = self.callbacks;
+        
+        thread::spawn(move || {
+            // Implement event polling and callback invocation
+            // ...
+        })
+    }
+}
+```
 
 ---
 
-### 4.4. Logging & Debugging
+### 4.6. Logging & Debugging
 
-Implces (for example, via the [`log`](https://crates.io/crates/log) crate and a logger implementation such as [`env_logger`](https://crates.io/crates/env_logger)). Log errors when spawning mpv, configuration load failures, and other runtime events.
+Implement logging using Rust's logging ecosystem (for example, via the `log` crate and a logger implementation such as `env_logger`). Log errors when spawning mpv, configuration load failures, and other runtime events.
 
 #### Example Logging Setup:
 
 ```rust
-use log::{info, error};
+use log::{info, error, debug};
 
 fn setup_logging() {
     env_logger::init();
 }
 
 // Use logging in your functions:
-pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> std::io::Result<()> {
+pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> io::Result<(std::process::Child, String)> {
     info!("Launching mpv for media: {}", file_or_url);
     // ... (spawn process)
     // Log errors, if any:
     // error!("Failed to launch mpv: {}", e);
-    Ok(())
+    Ok((process, socket_path))
 }
 ```
 
@@ -169,13 +333,13 @@ pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> std::io::Result<()> 
 
 ---
 
-### 4.5. Dependency Management
+### 4.7. Dependency Management
 
 - **Development:**  
   For v1, the crate assumes that mpv is installed on the target macOS system. Ensure that developers have mpv available in their PATH.
   
 - **Future Iterations:**  
-  In later versions, consider options for static linking via libmpv‑rs or bundling the mpv binary with the application.
+  In later versions, consider options for static linking or bundling the mpv binary with the application.
 
 ---
 
@@ -184,19 +348,19 @@ pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> std::io::Result<()> 
 ### 5.1. Crate Packaging
 
 - **Library Crate:**  
-  The video player is packaged as a library crate that exposes a minimal API (e.g., a `spawn_mpv` function). External applications (such as a Tauri app) can call this API to launch and control playback.
+  The video player is packaged as a library crate that exposes a clean API for launching and controlling mpv. External applications (such as a Tauri app) can call this API to launch and control playback.
   
 - **Asset Bundling:**  
   Ensure that the `assets/` directory (containing the Lua OSC script and configuration file) is included in the final package. Update your `.gitignore` and packaging scripts accordingly.
 
 ### 5.2. Integration Example
 
-In the `examples/integration_example.rs`, provide a minimal example of how to call the public API:
+In the `examples/ipc_control.rs`, provide an example of how to use the IPC features:
 
 ```rust
 fn main() {
     // Initialize logging
-    mpv_video_player::setup_logging();
+    neatflix_mpvrs::setup_logging();
 
     // Example media file or URL
     let media = "path/to/media/file.mp4";
@@ -204,31 +368,61 @@ fn main() {
     // Optional extra arguments to override defaults
     let extra_args = ["--volume=50"];
 
-    if let Err(e) = mpv_video_player::spawn_mpv(media, &extra_args) {
-        eprintln!("Error launching video player: {}", e);
+    // Spawn mpv and get the IPC socket path
+    let (process, socket_path) = match neatflix_mpvrs::player::spawn_mpv(media, &extra_args) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("Error launching video player: {}", e);
+            return;
+        }
+    };
+    
+    // Connect to the IPC socket
+    let mut ipc_client = match neatflix_mpvrs::player::ipc::MpvIpcClient::connect(&socket_path) {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("Error connecting to mpv IPC: {}", e);
+            return;
+        }
+    };
+    
+    // Example: Pause playback after 5 seconds
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    if let Err(e) = ipc_client.set_property("pause", serde_json::json!(true)) {
+        eprintln!("Error pausing playback: {}", e);
     }
+    
+    // Example: Resume playback after 2 seconds
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    if let Err(e) = ipc_client.set_property("pause", serde_json::json!(false)) {
+        eprintln!("Error resuming playback: {}", e);
+    }
+    
+    // Wait for the process to exit
+    let _ = process.wait();
 }
 ```
-
-Compile and run this example to verify that mpv launches correctly with the custom Lua OSC and configuration.
 
 ---
 
 ## 6. Conclusion
 
-This guide has detailed the design and implementation of a macOS‑focused video player crate in Rust that uses mpv and libmpv‑rs. The key highlights include:
+This guide has detailed the design and implementation of a macOS‑focused video player crate in Rust that uses mpv with CLI and JSON IPC. The key highlights include:
 
 - **Standalone Library Crate:**  
   A modular repository structure that isolates playback logic and assets.
 
 - **mpv Integration:**  
-  Spawning mpv with a custom Lua OSC for a modern UI and loading a dedicated configuration for stability.
+  Spawning mpv with a custom Lua OSC for a modern UI and enabling JSON IPC for programmatic control.
+
+- **Bidirectional Communication:**  
+  Using mpv's JSON IPC protocol for real-time control and status updates.
 
 - **Platform Focus:**  
   macOS is the primary target for v1, with future plans to add Windows and Linux support.
 
-- **Simplified Controls:**  
-  Playback controls are entirely handled by mpv through the Lua OSC, reducing the need for native UI controls.
+- **Dual Control Mechanisms:**  
+  Visual controls via the Lua OSC and programmatic control via JSON IPC.
 
 - **Flexible Configuration & Logging:**  
   The design allows for configuration overrides and employs standard logging for debugging.
