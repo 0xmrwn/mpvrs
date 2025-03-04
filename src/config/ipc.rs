@@ -1,5 +1,5 @@
 use crate::Result;
-use log::{debug, info};
+use log::debug;
 use std::path::PathBuf;
 use std::fs;
 
@@ -8,6 +8,12 @@ pub const DEFAULT_IPC_TIMEOUT_MS: u64 = 5000;
 
 /// Default polling interval for IPC events in milliseconds
 pub const DEFAULT_IPC_POLL_INTERVAL_MS: u64 = 100;
+
+/// Default maximum number of reconnection attempts
+pub const DEFAULT_MAX_RECONNECT_ATTEMPTS: u32 = 5;
+
+/// Default reconnection delay in milliseconds
+pub const DEFAULT_RECONNECT_DELAY_MS: u64 = 500;
 
 /// IPC configuration options
 #[derive(Debug, Clone)]
@@ -23,6 +29,9 @@ pub struct IpcConfig {
     
     /// Maximum number of reconnection attempts
     pub max_reconnect_attempts: u32,
+    
+    /// Delay between reconnection attempts in milliseconds
+    pub reconnect_delay_ms: u64,
 }
 
 impl Default for IpcConfig {
@@ -31,47 +40,94 @@ impl Default for IpcConfig {
             timeout_ms: DEFAULT_IPC_TIMEOUT_MS,
             poll_interval_ms: DEFAULT_IPC_POLL_INTERVAL_MS,
             auto_reconnect: true,
-            max_reconnect_attempts: 3,
+            max_reconnect_attempts: DEFAULT_MAX_RECONNECT_ATTEMPTS,
+            reconnect_delay_ms: DEFAULT_RECONNECT_DELAY_MS,
         }
     }
 }
 
-/// Ensures the IPC socket directory exists and is writable
-pub fn ensure_ipc_socket_dir() -> Result<PathBuf> {
-    #[cfg(target_family = "unix")]
-    {
-        // On Unix, we use /tmp which should already exist and be writable
-        let socket_dir = PathBuf::from("/tmp");
-        debug!("Using IPC socket directory: {}", socket_dir.display());
-        Ok(socket_dir)
+impl IpcConfig {
+    /// Creates a new IPC configuration with custom values
+    pub fn new(
+        timeout_ms: u64,
+        poll_interval_ms: u64,
+        auto_reconnect: bool,
+        max_reconnect_attempts: u32,
+        reconnect_delay_ms: u64,
+    ) -> Self {
+        Self {
+            timeout_ms,
+            poll_interval_ms,
+            auto_reconnect,
+            max_reconnect_attempts,
+            reconnect_delay_ms,
+        }
     }
     
-    #[cfg(target_family = "windows")]
-    {
-        // On Windows, we use the temp directory
-        let socket_dir = std::env::temp_dir();
-        debug!("Using IPC socket directory: {}", socket_dir.display());
-        Ok(socket_dir)
+    /// Creates a new IPC configuration with reconnection disabled
+    pub fn without_reconnect() -> Self {
+        Self {
+            timeout_ms: DEFAULT_IPC_TIMEOUT_MS,
+            poll_interval_ms: DEFAULT_IPC_POLL_INTERVAL_MS,
+            auto_reconnect: false,
+            max_reconnect_attempts: 0,
+            reconnect_delay_ms: DEFAULT_RECONNECT_DELAY_MS,
+        }
+    }
+    
+    /// Creates a new IPC configuration with more aggressive reconnection settings
+    pub fn with_aggressive_reconnect() -> Self {
+        Self {
+            timeout_ms: DEFAULT_IPC_TIMEOUT_MS,
+            poll_interval_ms: DEFAULT_IPC_POLL_INTERVAL_MS,
+            auto_reconnect: true,
+            max_reconnect_attempts: 10,
+            reconnect_delay_ms: 250,
+        }
     }
 }
 
-/// Cleans up old IPC sockets that might have been left behind
+/// Ensures the IPC socket directory exists
+pub fn ensure_ipc_socket_dir() -> Result<PathBuf> {
+    let socket_dir = if cfg!(target_family = "unix") {
+        // On Unix, use /tmp directory
+        PathBuf::from("/tmp")
+    } else {
+        // On Windows, use the temporary directory
+        let temp_dir = std::env::temp_dir();
+        temp_dir
+    };
+    
+    if !socket_dir.exists() {
+        debug!("Creating IPC socket directory: {}", socket_dir.display());
+        fs::create_dir_all(&socket_dir)?;
+    }
+    
+    Ok(socket_dir)
+}
+
+/// Cleans up old IPC sockets
 pub fn cleanup_old_ipc_sockets() -> Result<()> {
-    #[cfg(target_family = "unix")]
-    {
-        let socket_dir = ensure_ipc_socket_dir()?;
+    let socket_dir = ensure_ipc_socket_dir()?;
+    
+    if cfg!(target_family = "unix") {
+        // On Unix, look for socket files with the format "mpv-socket-*"
+        let entries = fs::read_dir(socket_dir)?;
         
-        // Find and remove old mpv sockets
-        if let Ok(entries) = fs::read_dir(socket_dir) {
-            for entry in entries.flatten() {
+        for entry in entries {
+            if let Ok(entry) = entry {
                 let path = entry.path();
-                if let Some(file_name) = path.file_name() {
-                    if let Some(file_name_str) = file_name.to_str() {
-                        if file_name_str.starts_with("mpv-socket-") {
-                            if let Err(e) = fs::remove_file(&path) {
-                                debug!("Failed to remove old IPC socket {}: {}", path.display(), e);
-                            } else {
-                                info!("Removed old IPC socket: {}", path.display());
+                
+                if path.is_file() {
+                    if let Some(filename) = path.file_name() {
+                        if let Some(filename_str) = filename.to_str() {
+                            if filename_str.starts_with("mpv-socket-") {
+                                // Try to delete the socket file
+                                if let Err(e) = fs::remove_file(&path) {
+                                    debug!("Failed to remove old socket file {}: {}", path.display(), e);
+                                } else {
+                                    debug!("Removed old socket file: {}", path.display());
+                                }
                             }
                         }
                     }
@@ -80,7 +136,7 @@ pub fn cleanup_old_ipc_sockets() -> Result<()> {
         }
     }
     
-    // No cleanup needed on Windows as named pipes are managed by the OS
+    // On Windows, named pipes are automatically cleaned up by the OS
     
     Ok(())
 } 

@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use uuid::Uuid;
+use crate::player::events::MpvEventListener;
 
 /// Validates configuration files to ensure they don't have common issues
 /// like trailing spaces after boolean values
@@ -225,4 +226,21 @@ pub fn spawn_mpv_with_preset(file_or_url: &str, preset_name: Option<&str>, extra
 /// Returns the path to the dedicated mpv configuration directory.
 fn get_mpv_config_path() -> PathBuf {
     crate::get_assets_path()
+}
+
+pub fn monitor_process(process: &mut Child, event_listener: &mut MpvEventListener) -> Result<i32> {
+    debug!("Starting to monitor mpv process");
+    
+    // Wait for the process to exit
+    let status = process.wait()?;
+    let exit_code = status.code().unwrap_or(-1);
+    
+    debug!("MPV process exited with status: {}, exit code: {}", status, exit_code);
+    
+    // Handle the process exit in the event listener
+    if let Err(e) = event_listener.handle_process_exit() {
+        error!("Error handling process exit: {}", e);
+    }
+    
+    Ok(exit_code)
 } 

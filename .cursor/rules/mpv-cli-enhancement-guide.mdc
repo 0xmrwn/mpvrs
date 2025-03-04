@@ -151,7 +151,6 @@ pub fn poll_events(&mut self) -> Vec<MpvEvent> {
 2. Create event system for higher-level events
 3. Add subscription mechanism for event consumers
 #### 7.3 Phase 3: Enhanced Features
-1. Add advanced playback control (chapters, playlists, etc.)
 2. Implement robust error handling and reconnection logic
 3. Add additional mpv property support
 ### 8. Tauri Integration Considerations
