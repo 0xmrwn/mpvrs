@@ -60,24 +60,49 @@ fn main() {
         eprintln!("Error subscribing to process exit events: {}", e);
     }
     
-    // Subscribe to time position changes
-    if let Err(e) = event_listener.subscribe("property:time-pos", |event| {
-        if let MpvEvent::PropertyChanged(property, value) = &event {
-            println!("Property changed: {} = {:?}", property, value);
+    // Subscribe to time position changes 
+    // Note: Will only be triggered approximately once per minute
+    if let Err(e) = event_listener.subscribe("time-position-changed", |event| {
+        if let MpvEvent::TimePositionChanged(position) = event {
+            println!("Playback progress: {:.2} seconds", position);
+            
+            // Here you could save the position for resume features
+            // For example:
+            // save_playback_position(current_media_id, position);
         }
     }) {
         eprintln!("Error subscribing to time position events: {}", e);
     }
     
     // Subscribe to playback state changes
-    if let Err(e) = event_listener.subscribe("property:pause", |event| {
-        match event {
-            MpvEvent::PlaybackPaused => println!("Playback paused"),
-            MpvEvent::PlaybackResumed => println!("Playback resumed"),
-            _ => {}
-        }
+    if let Err(e) = event_listener.subscribe("playback-paused", |_| {
+        println!("Playback paused");
     }) {
         eprintln!("Error subscribing to pause events: {}", e);
+    }
+    
+    if let Err(e) = event_listener.subscribe("playback-resumed", |_| {
+        println!("Playback resumed");
+    }) {
+        eprintln!("Error subscribing to resume events: {}", e);
+    }
+    
+    // Subscribe to playback completion
+    if let Err(e) = event_listener.subscribe("playback-completed", |_| {
+        println!("Playback completed!");
+        
+        // Here you could mark the media as watched
+        // For example:
+        // mark_media_as_watched(current_media_id);
+    }) {
+        eprintln!("Error subscribing to playback completion events: {}", e);
+    }
+    
+    // Subscribe to all events
+    if let Err(e) = event_listener.subscribe("all", |event| {
+        println!("Event received: {:?}", event);
+    }) {
+        eprintln!("Error subscribing to all events: {}", e);
     }
     
     // The event listener needs to be shared with the main thread

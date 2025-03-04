@@ -199,7 +199,7 @@ impl MpvEventListener {
     fn poll_events(
         ipc_client: &Arc<Mutex<MpvIpcClient>>,
         callbacks: &Arc<Mutex<HashMap<String, Vec<EventCallback>>>>,
-        property_observers: &Arc<Mutex<HashMap<String, u64>>>,
+        _property_observers: &Arc<Mutex<HashMap<String, u64>>>,
     ) {
         // Check if mpv is still connected and running
         let is_running = {
@@ -246,100 +246,147 @@ impl MpvEventListener {
             return;
         }
         
-        // Continue with property change polling
-        let property_observers_lock = match property_observers.lock() {
-            Ok(lock) => lock,
+        // Check property changes and emit events
+        let mut client = match ipc_client.lock() {
+            Ok(client) => client,
             Err(e) => {
-                error!("Failed to lock property observers: {:?}", e);
+                error!("Failed to lock IPC client: {:?}", e);
                 return;
             }
         };
         
-        for (property, _) in property_observers_lock.iter() {
-            let property_value = {
-                let mut client = match ipc_client.lock() {
-                    Ok(client) => client,
-                    Err(e) => {
-                        error!("Failed to lock IPC client: {:?}", e);
-                        continue;
-                    }
-                };
-                
-                match client.get_property(property) {
-                    Ok(value) => value,
-                    Err(e) => {
-                        // Only log at debug level since this could happen during normal shutdown
-                        debug!("Error getting property {}: {}", property, e);
-                        
-                        // If this is a connection error, check if mpv is still running
-                        if !client.is_connected() {
-                            debug!("MPV IPC client disconnected while polling events");
-                            return;
+        // Poll for property changes and other events
+        let properties_to_check = vec![
+            ("pause", "property:pause"),
+            ("time-pos", "property:time-pos"),
+            ("percent-pos", "property:percent-pos"),
+            ("eof-reached", "property:eof-reached"),
+        ];
+        
+        // Track high-level events that need to be triggered
+        let mut high_level_events = Vec::new();
+        
+        // Previously stored property values for comparison
+        static mut PREV_TIME_POS: Option<f64> = None;
+        static mut PREV_PAUSE_STATE: Option<bool> = None;
+        static mut PREV_EOF_STATE: Option<bool> = None;
+        
+        // Check each property
+        for (property, event_type) in properties_to_check {
+            match client.get_property(property) {
+                Ok(value) => {
+                    let callbacks_lock = match callbacks.lock() {
+                        Ok(lock) => lock,
+                        Err(e) => {
+                            error!("Failed to lock callbacks: {:?}", e);
+                            continue;
                         }
-                        
-                        continue;
+                    };
+                    
+                    // Generate a property changed event
+                    let prop_event = MpvEvent::PropertyChanged(property.to_string(), value.clone());
+                    
+                    // Handle specific property changes and convert to high-level events
+                    match property {
+                        "pause" => {
+                            if let Some(pause) = value.as_bool() {
+                                let prev_pause = unsafe { PREV_PAUSE_STATE };
+                                
+                                // Only emit event if state changed
+                                if prev_pause != Some(pause) {
+                                    if pause {
+                                        high_level_events.push(MpvEvent::PlaybackPaused);
+                                    } else {
+                                        high_level_events.push(MpvEvent::PlaybackResumed);
+                                    }
+                                    
+                                    unsafe { PREV_PAUSE_STATE = Some(pause); }
+                                }
+                            }
+                        },
+                        "time-pos" => {
+                            if let Some(time_pos) = value.as_f64() {
+                                let prev_time_pos = unsafe { PREV_TIME_POS };
+                                
+                                // Only emit event if the position changed by at least 60 seconds (minute accuracy)
+                                if prev_time_pos.is_none() || 
+                                   (prev_time_pos.unwrap() - time_pos).abs() >= 60.0 {
+                                    high_level_events.push(MpvEvent::TimePositionChanged(time_pos));
+                                    unsafe { PREV_TIME_POS = Some(time_pos); }
+                                }
+                            }
+                        },
+                        "eof-reached" => {
+                            if let Some(eof) = value.as_bool() {
+                                let prev_eof = unsafe { PREV_EOF_STATE };
+                                
+                                // Only emit completion event when EOF is reached
+                                if prev_eof != Some(eof) && eof {
+                                    high_level_events.push(MpvEvent::PlaybackCompleted);
+                                }
+                                
+                                unsafe { PREV_EOF_STATE = Some(eof); }
+                            }
+                        },
+                        _ => {}
+                    }
+                    
+                    // Notify property change subscribers
+                    if let Some(event_callbacks) = callbacks_lock.get(event_type) {
+                        for callback in event_callbacks {
+                            callback(prop_event.clone());
+                        }
+                    }
+                    
+                    // Also notify subscribers to all property changes
+                    if let Some(event_callbacks) = callbacks_lock.get("property") {
+                        for callback in event_callbacks {
+                            callback(prop_event.clone());
+                        }
+                    }
+                },
+                Err(e) => {
+                    // Only log as warning if it's not an EOF - which can happen when checking properties
+                    // after playback has completed
+                    if property != "eof-reached" {
+                        warn!("Failed to get property {}: {}", property, e);
                     }
                 }
-            };
-            
-            // Create a property changed event
-            let event = MpvEvent::PropertyChanged(property.clone(), property_value.clone());
-            
-            // Call the callbacks for this property
-            let event_type = format!("property:{}", property);
+            }
+        }
+        
+        // Trigger high-level events if any were generated
+        if !high_level_events.is_empty() {
             let callbacks_lock = match callbacks.lock() {
                 Ok(lock) => lock,
                 Err(e) => {
                     error!("Failed to lock callbacks: {:?}", e);
-                    continue;
+                    return;
                 }
             };
             
-            if let Some(callbacks) = callbacks_lock.get(&event_type) {
-                for callback in callbacks {
-                    callback(event.clone());
+            for event in high_level_events {
+                let event_type = match &event {
+                    MpvEvent::PlaybackPaused => "playback-paused",
+                    MpvEvent::PlaybackResumed => "playback-resumed",
+                    MpvEvent::PlaybackCompleted => "playback-completed",
+                    MpvEvent::TimePositionChanged(_) => "time-position-changed",
+                    _ => continue,
+                };
+                
+                // Notify specific event subscribers
+                if let Some(event_callbacks) = callbacks_lock.get(event_type) {
+                    for callback in event_callbacks {
+                        callback(event.clone());
+                    }
                 }
-            }
-            
-            // Also check for specific property events
-            match property.as_str() {
-                "time-pos" => {
-                    if let Some(pos) = property_value.as_f64() {
-                        let event = MpvEvent::TimePositionChanged(pos);
-                        if let Some(callbacks) = callbacks_lock.get("time-position-changed") {
-                            for callback in callbacks {
-                                callback(event.clone());
-                            }
-                        }
+                
+                // Also notify general event subscribers
+                if let Some(event_callbacks) = callbacks_lock.get("all") {
+                    for callback in event_callbacks {
+                        callback(event.clone());
                     }
-                },
-                "percent-pos" => {
-                    if let Some(pos) = property_value.as_f64() {
-                        let event = MpvEvent::PercentPositionChanged(pos);
-                        if let Some(callbacks) = callbacks_lock.get("percent-position-changed") {
-                            for callback in callbacks {
-                                callback(event.clone());
-                            }
-                        }
-                    }
-                },
-                "pause" => {
-                    if let Some(paused) = property_value.as_bool() {
-                        let event = if paused {
-                            MpvEvent::PlaybackPaused
-                        } else {
-                            MpvEvent::PlaybackResumed
-                        };
-                        
-                        let event_name = if paused { "playback-paused" } else { "playback-resumed" };
-                        if let Some(callbacks) = callbacks_lock.get(event_name) {
-                            for callback in callbacks {
-                                callback(event.clone());
-                            }
-                        }
-                    }
-                },
-                _ => {}
+                }
             }
         }
     }
