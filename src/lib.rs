@@ -25,6 +25,9 @@ pub enum Error {
     
     #[error("JSON error: {0}")]
     JsonError(#[from] serde_json::Error),
+    
+    #[error("Video ID error: {0}")]
+    VideoIdError(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

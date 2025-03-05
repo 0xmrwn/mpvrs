@@ -11,6 +11,7 @@ use log::{debug, error};
 use crate::player::events::MpvEventListener;
 use crate::player::ipc::MpvIpcClient;
 use crate::Result;
+use crate::Error;
 
 use std::collections::HashSet;
 use lazy_static::lazy_static;
@@ -33,6 +34,14 @@ impl VideoId {
     /// Converts the VideoId to a string
     pub fn to_string(&self) -> String {
         self.0.to_string()
+    }
+    
+    /// Creates a VideoId from a string representation of a UUID
+    pub fn from_string(s: &str) -> Result<Self> {
+        match Uuid::parse_str(s) {
+            Ok(uuid) => Ok(Self(uuid)),
+            Err(e) => Err(Error::VideoIdError(format!("Invalid VideoId string: {}", e)))
+        }
     }
 }
 
@@ -181,6 +190,19 @@ impl Drop for VideoInstance {
         
         debug!("VideoInstance with ID {} successfully dropped", self.id.to_string());
     }
+}
+
+/// Represents the current playback progress of a video
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaybackProgress {
+    /// Current playback position in seconds
+    pub position: f64,
+    /// Total duration of the video in seconds
+    pub duration: f64,
+    /// Playback position as a percentage (0-100)
+    pub percent: f64,
+    /// Whether playback is currently paused
+    pub is_paused: bool,
 }
 
 /// Manager for video instances with async support
@@ -794,6 +816,49 @@ impl VideoManager {
                 Err(crate::Error::MpvError(format!("Video instance not found: {}", id.to_string())))
             }
         }).await.unwrap()
+    }
+    
+    /// Gets the current playback progress for a video
+    pub async fn get_progress(&self, id: VideoId) -> Result<PlaybackProgress> {
+        let instances = self.instances.lock().unwrap();
+        
+        if let Some(instance) = instances.get(&id) {
+            let client = instance.ipc_client.clone();
+            let mut client_guard = client.lock().unwrap();
+            
+            // Get position
+            let position = match client_guard.get_property("playback-time") {
+                Ok(pos) => pos.as_f64().unwrap_or(0.0),
+                Err(_) => 0.0,
+            };
+            
+            // Get duration
+            let duration = match client_guard.get_property("duration") {
+                Ok(dur) => dur.as_f64().unwrap_or(0.0),
+                Err(_) => 0.0,
+            };
+            
+            // Get paused state
+            let is_paused = match client_guard.get_property("pause") {
+                Ok(paused) => paused.as_bool().unwrap_or(false),
+                Err(_) => false,
+            };
+            
+            let percent = if duration > 0.0 {
+                (position / duration) * 100.0
+            } else {
+                0.0
+            };
+            
+            Ok(PlaybackProgress {
+                position,
+                duration,
+                percent,
+                is_paused,
+            })
+        } else {
+            Err(Error::MpvError(format!("No video instance found with ID: {}", id.to_string())))
+        }
     }
 }
 
