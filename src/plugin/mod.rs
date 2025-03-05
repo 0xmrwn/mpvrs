@@ -12,8 +12,13 @@ use crate::player::events::MpvEventListener;
 use crate::player::ipc::MpvIpcClient;
 use crate::Result;
 
-use std::cell::RefCell;
 use std::collections::HashSet;
+use lazy_static::lazy_static;
+
+// Global event deduplication cache
+lazy_static! {
+    static ref NOTIFIED_EVENTS: Mutex<HashMap<String, HashSet<String>>> = Mutex::new(HashMap::new());
+}
 
 /// A unique identifier for a video instance
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -388,6 +393,7 @@ impl VideoManager {
     /// Closes all videos
     pub async fn close_all(&self) -> Result<()> {
         let instances = self.instances.clone();
+        let subscribers = self.event_subscribers.clone();
         
         // Spawn a blocking task to close all videos
         tokio::task::spawn_blocking(move || {
@@ -396,23 +402,48 @@ impl VideoManager {
             let ids: Vec<VideoId> = instances.keys().cloned().collect();
             for id in ids {
                 if let Some(mut instance) = instances.remove(&id) {
+                    debug!("Closing video with ID: {}", id.to_string());
+                    
+                    // First, mark the IPC client as intentionally closed
+                    if let Some(mut client) = instance.ipc_client.lock().ok() {
+                        debug!("Marking IPC client as intentionally closed for video {}", id.to_string());
+                        client.mark_as_intentionally_closed();
+                    }
+                    
                     // Stop the event listener if it exists
                     if let Some(mut listener) = instance.event_listener.take() {
+                        debug!("Stopping event listener for video {}", id.to_string());
                         let _ = listener.stop_listening();
+                        let _ = listener.handle_process_exit();
                     }
                     
                     // Attempt to quit mpv gracefully
                     if let Ok(mut client) = instance.ipc_client.lock() {
+                        debug!("Sending quit command to mpv for video {}", id.to_string());
                         let _ = client.quit();
+                        
+                        // For extra safety, explicitly close the connection
+                        client.close();
                     }
+                    
+                    // Wait briefly for mpv to process the quit command
+                    use std::thread::sleep;
+                    use std::time::Duration;
+                    sleep(Duration::from_millis(100));
                     
                     // Kill the process if it's still running
                     let _ = instance.process.kill();
                     
                     // Join the event thread if it exists
                     if let Some(thread) = instance.event_thread.take() {
+                        debug!("Joining event thread for video {}", id.to_string());
                         let _ = thread.join();
                     }
+                    
+                    // Notify subscribers that the video was closed
+                    Self::notify_subscribers(&subscribers, VideoEvent::Closed { id });
+                    
+                    debug!("Video {} closed successfully", id.to_string());
                 }
             }
             
@@ -453,11 +484,6 @@ impl VideoManager {
     
     /// Notifies subscribers of an event
     fn notify_subscribers(subscribers: &Arc<Mutex<Vec<EventSubscriber>>>, event: VideoEvent) {
-        // Use thread-local storage to track which events have been sent
-        thread_local! {
-            static NOTIFIED_EVENTS: RefCell<HashMap<String, HashSet<String>>> = RefCell::new(HashMap::new());
-        }
-
         // Get event type and video ID based on the enum variant
         let (event_type, video_id) = match &event {
             VideoEvent::Progress { id, .. } => ("progress", id),
@@ -469,19 +495,21 @@ impl VideoManager {
             VideoEvent::Error { id, .. } => ("error", id),
         };
 
-        // Check for "closed" or "ended" events to prevent duplicates
+        // Check for "closed" or "ended" events to prevent duplicates using process-wide cache
         if event_type == "closed" || event_type == "ended" {
-            let should_skip = NOTIFIED_EVENTS.with(|events| {
-                let mut events = events.borrow_mut();
+            let should_skip = {
+                let mut events = NOTIFIED_EVENTS.lock().unwrap();
                 let video_events = events.entry(video_id.0.to_string()).or_insert_with(HashSet::new);
                 if video_events.contains(event_type) {
-                    debug!("Skipping duplicate {} notification for video {:?}", event_type, video_id);
+                    debug!("Skipping duplicate {} notification for video {:?} (process-wide deduplication)", 
+                          event_type, video_id);
                     true
                 } else {
                     video_events.insert(event_type.to_string());
+                    debug!("Sending first {} notification for video {:?}", event_type, video_id);
                     false
                 }
-            });
+            };
 
             if should_skip {
                 return;

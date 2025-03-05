@@ -102,12 +102,18 @@ async fn main() {
     }
     
     // Ensure the video is properly closed if it hasn't been already
-    let _ = manager.close(video_id).await;
+    // Note: The event has already been sent by the monitoring thread, so we won't see duplicate events
+    if let Err(e) = manager.close(video_id).await {
+        eprintln!("Error closing video: {}", e);
+    }
     
     // Close the manager to ensure all resources are released
-    let _ = manager.close_all().await;
+    // This is typically only needed when shutting down the application
+    if let Err(e) = manager.close_all().await {
+        eprintln!("Error closing all videos: {}", e);
+    }
     
-    // Signal to the event task that we're done by dropping the subscription
+    // Signal that we're done by dropping the event task
     drop(event_task);
     
     println!("Example application completed successfully");

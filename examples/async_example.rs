@@ -1,4 +1,5 @@
 use neatflix_mpvrs::{VideoManager, PlaybackOptions, VideoEvent};
+use std::sync::{Arc, Mutex};
 
 #[tokio::main]
 async fn main() {
@@ -7,6 +8,10 @@ async fn main() {
 
     // Create a video manager
     let manager = VideoManager::new();
+    
+    // Flag to indicate when playback has ended or video has been closed
+    let playback_ended = Arc::new(Mutex::new(false));
+    let playback_ended_clone = playback_ended.clone();
     
     // Subscribe to video events
     let mut subscription = manager.subscribe().await;
@@ -35,12 +40,24 @@ async fn main() {
                 }
                 VideoEvent::Ended { id } => {
                     println!("Video {} ended", id.to_string());
+                    // Set the flag to indicate playback has ended
+                    if let Ok(mut ended) = playback_ended.lock() {
+                        *ended = true;
+                    }
                 }
                 VideoEvent::Closed { id } => {
                     println!("Video {} closed", id.to_string());
+                    // Set the flag to indicate video has been closed
+                    if let Ok(mut ended) = playback_ended.lock() {
+                        *ended = true;
+                    }
                 }
                 VideoEvent::Error { id, message } => {
                     println!("Video {} error: {}", id.to_string(), message);
+                    // Also set the flag on error
+                    if let Ok(mut ended) = playback_ended.lock() {
+                        *ended = true;
+                    }
                 }
             }
         }
@@ -54,7 +71,7 @@ async fn main() {
     };
     
     // Play a video (replace with your own video file)
-    let video_id = match manager.play("path/to/your/video.mp4".to_string(), options).await {
+    let video_id = match manager.play("http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4".to_string(), options).await {
         Ok(id) => {
             println!("Started video with ID: {}", id.to_string());
             id
@@ -65,14 +82,33 @@ async fn main() {
         }
     };
     
-    // Wait for 30 seconds
-    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+    // Wait for either 30 seconds or until the video ends naturally
+    let timeout_duration = tokio::time::Duration::from_secs(30);
+    let start_time = tokio::time::Instant::now();
+    
+    while !*playback_ended_clone.lock().unwrap() {
+        // Check if we've exceeded the timeout
+        if start_time.elapsed() >= timeout_duration {
+            println!("Reached 30 second timeout, closing video");
+            break;
+        }
+        
+        // Check every 500ms
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
     
     // Close the video
     if let Err(e) = manager.close(video_id).await {
         eprintln!("Error closing video: {}", e);
     }
     
-    // Wait for the event task to finish
-    let _ = event_task.await;
+    // Close all videos to ensure cleanup
+    if let Err(e) = manager.close_all().await {
+        eprintln!("Error closing all videos: {}", e);
+    }
+    
+    // Signal that we're done by dropping the event task
+    drop(event_task);
+    
+    println!("Example application completed successfully");
 } 
