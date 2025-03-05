@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use serde_json::Value;
-use log::{debug, error, warn};
+use log::{debug, error};
 
 use crate::player::ipc::MpvIpcClient;
 use crate::Error;
@@ -220,7 +220,9 @@ impl MpvEventListener {
     
     /// Stops the event listener.
     pub fn stop_listening(&mut self) -> Result<()> {
-        // Mark as not running
+        debug!("Stopping event listener");
+        
+        // Mark as not running first to stop the polling thread
         let mut running = self.running.lock().unwrap();
         if !*running {
             debug!("Event listener is not running");
@@ -230,6 +232,23 @@ impl MpvEventListener {
         *running = false;
         drop(running);
         
+        // Mark the IPC client as intentionally closed first, before any unobserve attempts
+        // This prevents the client from attempting to reconnect while we're shutting down
+        {
+            let mut ipc_client = match self.ipc_client.lock() {
+                Ok(client) => client,
+                Err(e) => {
+                    error!("Failed to lock IPC client when stopping event listener: {:?}", e);
+                    // Continue with cleanup even if we couldn't lock the client
+                    return Ok(());
+                }
+            };
+            
+            // Mark as intentionally closed to prevent any reconnection attempts
+            debug!("Marking IPC client as intentionally closed in stop_listening");
+            ipc_client.mark_as_intentionally_closed();
+        }
+        
         // Wait for the poll thread to stop
         if let Some(thread) = self.poll_thread.take() {
             debug!("Waiting for event polling thread to stop");
@@ -238,20 +257,22 @@ impl MpvEventListener {
             }
         }
         
-        // Unobserve all properties
-        let mut ipc_client = self.ipc_client.lock().unwrap();
-        let property_observers = self.property_observers.lock().unwrap();
-        
-        for (property, observe_id) in property_observers.iter() {
-            debug!("Unobserving property: {} with ID: {}", property, observe_id);
-            
-            if let Err(e) = ipc_client.unobserve_property(*observe_id) {
-                warn!("Failed to unobserve property {}: {}", property, e);
+        // Now unobserve properties if the client is still connected
+        // But only do this if we can acquire the locks without waiting
+        if let Ok(mut ipc_client) = self.ipc_client.try_lock() {
+            if let Ok(property_observers) = self.property_observers.try_lock() {
+                for (property, observe_id) in property_observers.iter() {
+                    debug!("Unobserving property: {} with ID: {}", property, observe_id);
+                    
+                    // Only attempt to unobserve if the client is still connected
+                    if ipc_client.is_connected() {
+                        if let Err(e) = ipc_client.unobserve_property(*observe_id) {
+                            debug!("Failed to unobserve property {}: {} - likely already disconnected", property, e);
+                        }
+                    }
+                }
             }
         }
-        
-        // Mark the client as intentionally closed to prevent reconnection attempts
-        ipc_client.mark_as_intentionally_closed();
         
         debug!("Event listener stopped");
         Ok(())
@@ -299,6 +320,12 @@ impl MpvEventListener {
                 return;
             }
         };
+        
+        // If the client is intentionally closed, don't try to poll for events
+        if ipc_client.is_intentionally_closed() {
+            debug!("Skipping event polling for intentionally closed client");
+            return;
+        }
         
         // Track when the last position update was sent
         static mut LAST_POSITION_UPDATE: Option<Instant> = None;

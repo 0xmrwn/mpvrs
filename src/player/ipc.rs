@@ -466,7 +466,7 @@ impl MpvIpcClient {
     }
     
     /// Checks if we should attempt to reconnect based on the error
-    fn should_reconnect(&self, error: &Error) -> bool {
+    fn should_reconnect(&mut self, error: &Error) -> bool {
         // Always honor intentionally_closed flag
         if self.intentionally_closed {
             debug!("Not reconnecting because client was intentionally closed");
@@ -476,16 +476,28 @@ impl MpvIpcClient {
         // Check for common socket errors that indicate the process has terminated
         let is_terminal_error = match error {
             // Broken pipe typically means the process has already exited
-            Error::Io(err) if err.kind() == std::io::ErrorKind::BrokenPipe => true,
+            Error::Io(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {
+                debug!("Detected broken pipe error, marking as intentionally closed");
+                true
+            },
             
             // Connection refused means the socket is no longer available
-            Error::Io(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => true,
+            Error::Io(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                debug!("Detected connection refused error, marking as intentionally closed");
+                true
+            },
             
             // Connection reset indicates the process has terminated
-            Error::Io(err) if err.kind() == std::io::ErrorKind::ConnectionReset => true,
+            Error::Io(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+                debug!("Detected connection reset error, marking as intentionally closed");
+                true
+            },
             
             // EOF-related errors
-            Error::MpvError(msg) if msg.contains("End of file") => true,
+            Error::MpvError(msg) if msg.contains("End of file") => {
+                debug!("Detected EOF error, marking as intentionally closed");
+                true
+            },
             
             // Property unavailable often happens during shutdown
             Error::MpvError(msg) if msg.contains("property unavailable") && self.connected => {
@@ -497,7 +509,10 @@ impl MpvIpcClient {
         };
 
         if is_terminal_error {
-            debug!("Not reconnecting because terminal error detected: {}", error);
+            // This is a key addition: mark as intentionally closed when terminal errors are detected
+            // because these almost always mean mpv has exited
+            self.intentionally_closed = true;
+            debug!("Not reconnecting and marking as intentionally closed because terminal error detected: {}", error);
             return false;
         }
 
@@ -509,7 +524,19 @@ impl MpvIpcClient {
     fn send_request(&mut self, request: &Value) -> Result<()> {
         // First check if the client was intentionally closed
         if self.intentionally_closed {
+            debug!("Not sending request because client was intentionally closed");
             return Err(Error::MpvError("Client was intentionally closed".to_string()));
+        }
+
+        // Check if the socket file exists before attempting to reconnect or send
+        #[cfg(target_family = "unix")]
+        {
+            let socket_path = std::path::Path::new(&self.socket_path);
+            if !socket_path.exists() {
+                debug!("Socket path does not exist before sending request, marking as intentionally closed");
+                self.intentionally_closed = true;
+                return Err(Error::MpvError("Socket file does not exist, mpv process has likely terminated".to_string()));
+            }
         }
 
         if !self.connected {
@@ -528,10 +555,24 @@ impl MpvIpcClient {
             match self.socket.write_all(format!("{}\n", request_str).as_bytes()) {
                 Ok(_) => {
                     debug!("Request sent successfully");
+                    // Reset reconnect attempts on successful send
+                    self.reset_reconnect_attempts();
                     Ok(())
                 },
                 Err(e) => {
-                    error!("Failed to send request: {}", e);
+                    // Only log as error if not already marked as intentionally closed
+                    if !self.intentionally_closed {
+                        error!("Failed to send request: {}", e);
+                    } else {
+                        debug!("Failed to send request to intentionally closed client: {}", e);
+                    }
+                    
+                    // Check if this is a terminal error like broken pipe
+                    if e.kind() == std::io::ErrorKind::BrokenPipe || 
+                       e.kind() == std::io::ErrorKind::ConnectionReset {
+                        debug!("Terminal error detected during send, marking as intentionally closed");
+                        self.intentionally_closed = true;
+                    }
                     self.connected = false;
                     Err(Error::Io(e))
                 }
@@ -543,10 +584,24 @@ impl MpvIpcClient {
             match self.socket.write_all(format!("{}\n", request_str).as_bytes()) {
                 Ok(_) => {
                     debug!("Request sent successfully");
+                    // Reset reconnect attempts on successful send
+                    self.reset_reconnect_attempts();
                     Ok(())
                 },
                 Err(e) => {
-                    error!("Failed to send request: {}", e);
+                    // Only log as error if not already marked as intentionally closed
+                    if !self.intentionally_closed {
+                        error!("Failed to send request: {}", e);
+                    } else {
+                        debug!("Failed to send request to intentionally closed client: {}", e);
+                    }
+                    
+                    // Check if this is a terminal error
+                    if e.kind() == std::io::ErrorKind::BrokenPipe || 
+                       e.kind() == std::io::ErrorKind::ConnectionReset {
+                        debug!("Terminal error detected during send, marking as intentionally closed");
+                        self.intentionally_closed = true;
+                    }
                     self.connected = false;
                     Err(Error::Io(e))
                 }

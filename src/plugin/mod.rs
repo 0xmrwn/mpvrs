@@ -6,11 +6,14 @@ use tokio::task::JoinHandle as TokioJoinHandle;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use log::debug;
+use log::{debug, error};
 
 use crate::player::events::MpvEventListener;
 use crate::player::ipc::MpvIpcClient;
 use crate::Result;
+
+use std::cell::RefCell;
+use std::collections::HashSet;
 
 /// A unique identifier for a video instance
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -322,23 +325,31 @@ impl VideoManager {
         let subscribers = self.event_subscribers.clone();
         
         // Spawn a blocking task to close the video
-        tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             debug!("Closing video with ID: {}", id.to_string());
             let mut instances = instances.lock().unwrap();
             
             if let Some(mut instance) = instances.remove(&id) {
-                // Stop the event listener if it exists
+                // First, mark the IPC client as intentionally closed
+                // Do this before anything else to prevent reconnection attempts
+                if let Some(mut client) = instance.ipc_client.lock().ok() {
+                    debug!("Marking IPC client as intentionally closed for video {}", id.to_string());
+                    client.mark_as_intentionally_closed();
+                }
+                
+                // Then stop the event listener if it exists
                 if let Some(mut listener) = instance.event_listener.take() {
                     debug!("Stopping event listener for video {}", id.to_string());
                     let _ = listener.stop_listening();
                     let _ = listener.handle_process_exit();
                 }
                 
-                // Mark the IPC client as intentionally closed
+                // Now try to send the quit command if still possible
                 if let Some(mut client) = instance.ipc_client.lock().ok() {
-                    debug!("Sending quit command to mpv for video {}", id.to_string());
-                    // This will mark the client as intentionally closed
-                    let _ = client.quit();
+                    if client.is_connected() {
+                        debug!("Sending quit command to mpv for video {}", id.to_string());
+                        let _ = client.quit();  // This also marks as intentionally closed
+                    }
                     
                     // For extra safety, explicitly close the connection
                     client.close();
@@ -352,16 +363,26 @@ impl VideoManager {
                 // Kill the process if it's still running
                 let _ = instance.process.kill();
                 
+                // Wait for any event thread to complete
+                if let Some(thread) = instance.event_thread.take() {
+                    debug!("Joining event thread for video {}", id.to_string());
+                    let _ = thread.join();
+                }
+                
                 // Notify subscribers that the video was closed
                 Self::notify_subscribers(&subscribers, VideoEvent::Closed { id });
                 
                 debug!("Video {} closed successfully", id.to_string());
-            } else {
-                debug!("Video {} not found for closing", id.to_string());
             }
             
             Ok(())
-        }).await.unwrap()
+        }).await {
+            Ok(result) => result,
+            Err(e) => {
+                error!("Failed to join task for closing video {}: {:?}", id.to_string(), e);
+                Ok(()) // Convert JoinError to success since we just want to continue
+            }
+        }
     }
     
     /// Closes all videos
@@ -432,9 +453,49 @@ impl VideoManager {
     
     /// Notifies subscribers of an event
     fn notify_subscribers(subscribers: &Arc<Mutex<Vec<EventSubscriber>>>, event: VideoEvent) {
+        // Use thread-local storage to track which events have been sent
+        thread_local! {
+            static NOTIFIED_EVENTS: RefCell<HashMap<String, HashSet<String>>> = RefCell::new(HashMap::new());
+        }
+
+        // Get event type and video ID based on the enum variant
+        let (event_type, video_id) = match &event {
+            VideoEvent::Progress { id, .. } => ("progress", id),
+            VideoEvent::Started { id } => ("started", id),
+            VideoEvent::Paused { id } => ("paused", id),
+            VideoEvent::Resumed { id } => ("resumed", id),
+            VideoEvent::Ended { id } => ("ended", id),
+            VideoEvent::Closed { id } => ("closed", id),
+            VideoEvent::Error { id, .. } => ("error", id),
+        };
+
+        // Check for "closed" or "ended" events to prevent duplicates
+        if event_type == "closed" || event_type == "ended" {
+            let should_skip = NOTIFIED_EVENTS.with(|events| {
+                let mut events = events.borrow_mut();
+                let video_events = events.entry(video_id.0.to_string()).or_insert_with(HashSet::new);
+                if video_events.contains(event_type) {
+                    debug!("Skipping duplicate {} notification for video {:?}", event_type, video_id);
+                    true
+                } else {
+                    video_events.insert(event_type.to_string());
+                    false
+                }
+            });
+
+            if should_skip {
+                return;
+            }
+        }
+
+        // Get the subscribers and notify them
         if let Ok(subscribers) = subscribers.lock() {
+            // Notify all subscribers of the event
             for subscriber in subscribers.iter() {
-                let _ = subscriber.sender.try_send(event.clone());
+                // Use try_send to avoid blocking
+                if let Err(e) = subscriber.sender.try_send(event.clone()) {
+                    debug!("Failed to notify subscriber: {}", e);
+                }
             }
         }
     }
@@ -455,24 +516,68 @@ impl VideoManager {
         let mut last_position = -1.0;
         let mut last_paused = false;
         let mut consecutive_errors = 0;
-        let mut playback_status = String::new();  // Track playback status
+        let mut last_playback_status = String::new();  // Track previous playback status for changes
+        let max_consecutive_errors = 3;  // Maximum number of consecutive errors before considering the player closed
         
         loop {
             // Sleep for the specified interval
             thread::sleep(interval);
             
-            // Check if the ipc client is connected
-            let is_running = if let Ok(mut client) = ipc_client.lock() {
-                client.is_running()
+            // First check if we are intentionally closed already
+            let is_intentionally_closed = if let Ok(client) = ipc_client.lock() {
+                client.is_intentionally_closed()
             } else {
                 false
             };
             
-            // If process is not running, break out of the loop
-            if !is_running {
-                debug!("MPV process is no longer running for video {}", id.to_string());
+            if is_intentionally_closed {
+                debug!("IPC client for video {} is marked as intentionally closed, stopping monitoring", 
+                       id.to_string());
                 Self::notify_subscribers(&subscribers, VideoEvent::Closed { id });
                 break;
+            }
+            
+            // Check if the ipc client is connected and socket exists
+            // This is more reliable than just checking is_running
+            let socket_exists = if let Ok(mut client) = ipc_client.lock() {
+                match client.get_property("pid") {
+                    Ok(_) => {
+                        // Successfully communicated, reset error counter
+                        consecutive_errors = 0;
+                        true
+                    },
+                    Err(err) => {
+                        debug!("Error checking mpv pid for video {}: {:?}", id.to_string(), err);
+                        consecutive_errors += 1;
+                        
+                        // After multiple consecutive errors, assume the player is closed
+                        if consecutive_errors >= max_consecutive_errors {
+                            debug!("Reached max consecutive errors for video {}, assuming player closed", 
+                                   id.to_string());
+                            // Mark as intentionally closed to prevent further reconnection attempts
+                            client.mark_as_intentionally_closed();
+                            Self::notify_subscribers(&subscribers, VideoEvent::Closed { id });
+                            break;
+                        }
+                        
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            
+            if !socket_exists {
+                consecutive_errors += 1;
+                if consecutive_errors >= max_consecutive_errors {
+                    debug!("Socket no longer exists for video {}, stopping monitoring", id.to_string());
+                    if let Ok(mut client) = ipc_client.lock() {
+                        client.mark_as_intentionally_closed();
+                    }
+                    Self::notify_subscribers(&subscribers, VideoEvent::Closed { id });
+                    break;
+                }
+                continue;
             }
             
             // Check current playback status - useful for detecting OSC-triggered actions
@@ -485,46 +590,36 @@ impl VideoManager {
                 String::new()
             };
             
-            // If playback status changes to "stopped" or "idle", it might indicate
+            // If playback status changes to "idle", it might indicate
             // the user has closed the player via OSC
-            if !current_status.is_empty() && current_status != playback_status {
+            if !current_status.is_empty() && current_status != last_playback_status {
                 debug!("Playback status changed from '{}' to '{}' for video {}", 
-                       playback_status, current_status, id.to_string());
+                      last_playback_status, current_status, id.to_string());
                 
-                // If status indicates player is stopping
-                if current_status == "idle" || current_status == "stopped" {
-                    debug!("Detected player stopping via OSC controls for video {}", id.to_string());
+                // Check for transitions that indicate OSC closure
+                if current_status == "idle" {
+                    debug!("Detected transition to idle state for video {}, likely OSC closure", id.to_string());
+                    if let Ok(mut client) = ipc_client.lock() {
+                        // Mark as intentionally closed to prevent reconnection attempts
+                        client.mark_as_intentionally_closed();
+                    }
                     Self::notify_subscribers(&subscribers, VideoEvent::Closed { id });
                     break;
                 }
                 
-                playback_status = current_status;
+                last_playback_status = current_status;
             }
             
-            // Get the current playback state
+            // Get current playback position
             let position = if let Ok(mut client) = ipc_client.lock() {
-                match client.get_property("time-pos") {
-                    Ok(value) => {
-                        consecutive_errors = 0; // Reset error counter on success
-                        value.as_f64()
-                    },
-                    Err(e) => {
-                        debug!("Error getting time-pos: {:?}", e);
-                        consecutive_errors += 1;
-                        None
-                    }
+                if let Ok(value) = client.get_property("time-pos") {
+                    value.as_f64()
+                } else {
+                    None
                 }
             } else {
-                consecutive_errors += 1;
                 None
             };
-            
-            // If we have too many consecutive errors, assume the process has terminated
-            if consecutive_errors > 3 {  // Reduced from 5 to 3 for faster detection
-                debug!("Too many consecutive errors, assuming mpv has terminated for video {}", id.to_string());
-                Self::notify_subscribers(&subscribers, VideoEvent::Closed { id });
-                break;
-            }
             
             let duration = if let Ok(mut client) = ipc_client.lock() {
                 if let Ok(value) = client.get_property("duration") {
@@ -601,6 +696,10 @@ impl VideoManager {
             // Check if playback has ended
             if eof {
                 debug!("EOF reached for video {}", id.to_string());
+                if let Ok(mut client) = ipc_client.lock() {
+                    // Mark as intentionally closed when EOF is reached
+                    client.mark_as_intentionally_closed();
+                }
                 Self::notify_subscribers(&subscribers, VideoEvent::Ended { id });
                 break;
             }
@@ -608,12 +707,24 @@ impl VideoManager {
             // Check if the file has been closed
             if idle_active {
                 debug!("Idle active detected for video {}", id.to_string());
+                if let Ok(mut client) = ipc_client.lock() {
+                    // Mark as intentionally closed when player becomes idle
+                    client.mark_as_intentionally_closed();
+                }
                 Self::notify_subscribers(&subscribers, VideoEvent::Closed { id });
                 break;
             }
         }
         
         debug!("Playback monitoring completed for video {}", id.to_string());
+        
+        // Ensure IPC client is marked as intentionally closed at the end
+        if let Ok(mut client) = ipc_client.lock() {
+            if !client.is_intentionally_closed() {
+                debug!("Making sure IPC client is marked as intentionally closed at monitoring end");
+                client.mark_as_intentionally_closed();
+            }
+        }
     }
     
     /// Updates window properties for a video instance
