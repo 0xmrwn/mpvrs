@@ -1,5 +1,6 @@
 use neatflix_mpvrs::{VideoManager, PlaybackOptions, VideoEvent};
 use std::env;
+use std::sync::{Arc, Mutex};
 
 #[tokio::main]
 async fn main() {
@@ -23,6 +24,10 @@ async fn main() {
     
     // Subscribe to video events
     let mut subscription = manager.subscribe().await;
+    
+    // Flag to indicate when playback has ended or video has been closed
+    let playback_ended = Arc::new(Mutex::new(false));
+    let playback_ended_clone = playback_ended.clone();
     
     // Start a task to handle events
     let event_task = tokio::spawn(async move {
@@ -48,12 +53,24 @@ async fn main() {
                 }
                 VideoEvent::Ended { id } => {
                     println!("Video {} ended", id.to_string());
+                    // Set the flag to indicate playback has ended
+                    if let Ok(mut ended) = playback_ended.lock() {
+                        *ended = true;
+                    }
                 }
                 VideoEvent::Closed { id } => {
                     println!("Video {} closed", id.to_string());
+                    // Set the flag to indicate video has been closed
+                    if let Ok(mut ended) = playback_ended.lock() {
+                        *ended = true;
+                    }
                 }
                 VideoEvent::Error { id, message } => {
                     println!("Video {} error: {}", id.to_string(), message);
+                    // Also set the flag on error
+                    if let Ok(mut ended) = playback_ended.lock() {
+                        *ended = true;
+                    }
                 }
             }
         }
@@ -79,14 +96,19 @@ async fn main() {
         }
     };
     
-    // Wait for 30 seconds
-    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-    
-    // Close the video
-    if let Err(e) = manager.close(video_id).await {
-        eprintln!("Error closing video: {}", e);
+    // Wait for the video to end or be closed, checking the flag periodically
+    while !*playback_ended_clone.lock().unwrap() {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
     
-    // Wait for the event task to finish
-    let _ = event_task.await;
+    // Ensure the video is properly closed if it hasn't been already
+    let _ = manager.close(video_id).await;
+    
+    // Close the manager to ensure all resources are released
+    let _ = manager.close_all().await;
+    
+    // Signal to the event task that we're done by dropping the subscription
+    drop(event_task);
+    
+    println!("Example application completed successfully");
 } 

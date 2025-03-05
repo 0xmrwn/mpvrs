@@ -1,12 +1,13 @@
-use crate::Result;
-use log::{debug, error, warn};
-use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use serde_json::Value;
+use log::{debug, error, warn};
 
-use super::ipc::MpvIpcClient;
+use crate::player::ipc::MpvIpcClient;
+use crate::Error;
+use crate::Result;
 
 /// Types of events that can be emitted by mpv.
 #[derive(Debug, Clone)]
@@ -363,25 +364,74 @@ impl MpvEventListener {
         }
     }
     
-    /// Checks if playback has ended
+    /// Checks if playback has reached the end
     fn check_eof(
         ipc_client: &mut MpvIpcClient,
         callbacks: &Arc<Mutex<HashMap<String, Vec<EventCallback>>>>,
     ) {
-        // Check if playback has ended
-        match ipc_client.get_property("eof-reached") {
-            Ok(Value::Bool(true)) => {
-                debug!("EOF reached detected, marking as intentionally closed");
-                ipc_client.mark_as_intentionally_closed();
-                Self::notify_callbacks(callbacks, "playback", &MpvEvent::PlaybackCompleted);
+        // First, check if the ipc client is still connected and the process still running
+        if !ipc_client.is_connected() {
+            debug!("IPC client disconnected while checking EOF");
+            
+            // Check if it was an intentional close
+            if ipc_client.is_intentionally_closed() {
+                debug!("IPC client was intentionally closed, sending ProcessExited event");
+                Self::notify_callbacks(callbacks, "process", &MpvEvent::ProcessExited(0));
+            } else {
+                debug!("IPC client disconnected unexpectedly, sending ConnectionLost event");
+                Self::notify_callbacks(callbacks, "connection", &MpvEvent::ConnectionLost);
+            }
+            return;
+        }
+        
+        // Check if we're at the end of playback via multiple signals
+        
+        // 1. Check direct EOF property
+        let eof_reached = match ipc_client.get_property("eof-reached") {
+            Ok(value) => {
+                match value.as_bool() {
+                    Some(true) => {
+                        debug!("EOF reached directly reported by mpv property");
+                        true
+                    },
+                    _ => false,
+                }
+            },
+            Err(err) => {
+                // If we get property unavailable error, mpv might be shutting down
+                if let Error::MpvError(ref msg) = err {
+                    if msg.contains("property unavailable") {
+                        debug!("EOF property unavailable, mpv may be shutting down");
+                        
+                        // Mark as intentionally closed to avoid reconnection attempts
+                        ipc_client.mark_as_intentionally_closed();
+                        Self::notify_callbacks(callbacks, "process", &MpvEvent::ProcessExited(0));
+                        return;
+                    }
+                }
                 
-                // Reset the eof-reached property to false to avoid repeated notifications
-                let _ = ipc_client.set_property("eof-reached", json!(false));
+                debug!("Error checking EOF: {:?}", err);
+                false
             }
-            Ok(_) => {}
-            Err(e) => {
-                debug!("Error checking EOF status: {}", e);
-            }
+        };
+        
+        // 2. Check idle status - idle_active can indicate playback has ended
+        let idle_active = match ipc_client.get_property("idle-active") {
+            Ok(value) => value.as_bool().unwrap_or(false),
+            Err(_) => false,
+        };
+        
+        // 3. Check playback status - "idle" means no file is playing
+        let playback_status = match ipc_client.get_playback_status() {
+            Ok(status) => status,
+            Err(_) => String::new(),
+        };
+        
+        // If any of these indicators suggest EOF, notify about it
+        if eof_reached || idle_active || playback_status == "idle" {
+            debug!("EOF detected: eof_reached={}, idle_active={}, playback_status={}", 
+                   eof_reached, idle_active, playback_status);
+            Self::notify_callbacks(callbacks, "eof", &MpvEvent::PlaybackCompleted);
         }
     }
     
@@ -446,10 +496,23 @@ impl MpvEventListener {
     pub fn handle_process_exit(&mut self) -> Result<()> {
         debug!("Handling process exit in event listener");
         
+        // Set running to false to stop event loop
+        if let Ok(mut running) = self.running.lock() {
+            *running = false;
+        }
+        
         // Mark the IPC client as intentionally closed to prevent reconnection attempts
         if let Ok(mut client) = self.ipc_client.lock() {
             debug!("Marking IPC client as intentionally closed due to process exit");
             client.mark_as_intentionally_closed();
+            
+            // Explicitly close the connection
+            client.close();
+        }
+        
+        // Clear all property observers to prevent further attempts to access them
+        if let Ok(mut observers) = self.property_observers.lock() {
+            observers.clear();
         }
         
         // Notify about process exit
@@ -460,6 +523,7 @@ impl MpvEventListener {
         // Stop listening
         self.stop_listening()?;
         
+        debug!("Process exit handling completed");
         Ok(())
     }
 } 

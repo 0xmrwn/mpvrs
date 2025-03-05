@@ -1,9 +1,12 @@
-use log::{error, info};
-use neatflix_mpvrs::{config, setup_logging, MpvEvent};
+use log::{error, info, debug};
+use neatflix_mpvrs::{setup_logging, MpvEvent, VideoEvent, PlaybackOptions, VideoManager};
 use std::env;
 use std::process::Command;
+use std::process::Child;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use tokio::runtime::Runtime;
 
 fn check_mpv_installed() -> bool {
     match Command::new("which").arg("mpv").output() {
@@ -12,148 +15,308 @@ fn check_mpv_installed() -> bool {
     }
 }
 
-fn main() {
-    // Initialize logging
-    setup_logging();
-    info!("neatflix-mpvrs v{}", neatflix_mpvrs::version());
+/// Monitors the mpv process and returns when it exits
+fn monitor_process(process: Arc<Mutex<Child>>, event_listener: Option<Arc<Mutex<neatflix_mpvrs::MpvEventListener>>>) {
+    let check_interval = Duration::from_millis(500);
     
-    // Set RUST_LOG environment variable if not already set
+    // Create a flag to track if process has exited
+    let process_exited = Arc::new(Mutex::new(false));
+    let process_exited_clone = Arc::clone(&process_exited);
+    let process_clone = Arc::clone(&process);
+    
+    // Spawn a thread to wait for the process to exit
+    let wait_thread = thread::spawn(move || {
+        debug!("Process monitor thread started");
+        if let Ok(mut process_guard) = process_clone.lock() {
+            match process_guard.wait() {
+                Ok(exit_status) => {
+                    info!("MPV process exited with status: {}", exit_status);
+                    // Set the exited flag
+                    if let Ok(mut exited) = process_exited.lock() {
+                        *exited = true;
+                    }
+                },
+                Err(e) => {
+                    error!("Error waiting for mpv process: {}", e);
+                }
+            }
+        }
+        debug!("Process monitor thread completed");
+    });
+    
+    // If we have an event listener, handle process exit events
+    if let Some(event_listener) = event_listener {
+        // Subscribe to process exit events
+        if let Ok(mut listener) = event_listener.lock() {
+            let process_exited_clone2 = Arc::clone(&process_exited_clone);
+            if let Err(e) = listener.subscribe("process", move |event| {
+                if let MpvEvent::ProcessExited(_) = event {
+                    info!("Received process exit event from IPC");
+                    // Update the exited flag
+                    if let Ok(mut exited) = process_exited_clone2.lock() {
+                        *exited = true;
+                    }
+                }
+            }) {
+                error!("Error subscribing to process exit events: {}", e);
+            }
+        }
+    }
+    
+    // Wait for the process to exit or be manually closed
+    loop {
+        // Check if the process has exited
+        if let Ok(exited) = process_exited_clone.lock() {
+            if *exited {
+                debug!("Process exited flag is set, breaking monitoring loop");
+                break;
+            }
+        }
+        
+        // Check if the process is still running
+        let is_running = if let Ok(mut process_guard) = process.lock() {
+            match process_guard.try_wait() {
+                Ok(None) => true,      // Process still running
+                Ok(Some(_)) => false,  // Process exited
+                Err(_) => false,       // Error checking process
+            }
+        } else {
+            false
+        };
+        
+        if !is_running {
+            debug!("Process is no longer running, breaking monitoring loop");
+            break;
+        }
+        
+        // Sleep before checking again
+        thread::sleep(check_interval);
+    }
+    
+    // Wait for the wait thread to complete
+    let _ = wait_thread.join();
+    
+    info!("Process monitoring completed");
+}
+
+fn main() {
+    // Setup logging
+    setup_logging();
+
+    // Check if mpv is installed
+    if !check_mpv_installed() {
+        error!("mpv is not installed. Please install it to use this application.");
+        std::process::exit(1);
+    }
+
+    // Set RUST_LOG if not already set
     if env::var("RUST_LOG").is_err() {
         env::set_var("RUST_LOG", "info");
     }
-    
-    // Check if mpv is installed
-    if !check_mpv_installed() {
-        eprintln!("Error: mpv is not installed or not in your PATH.");
-        eprintln!("Please install mpv before using neatflix-mpvrs.");
-        eprintln!("On macOS, you can install it with: brew install mpv");
-        std::process::exit(1);
-    }
-    
-    // Initialize default configuration
-    if let Err(e) = config::initialize_default_config() {
-        error!("Failed to initialize configuration: {}", e);
-        std::process::exit(1);
-    }
-    
-    // Get media file from command line arguments or use a default
+
+    // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
-    
-    // Check for special commands that don't require a media file
-    if args.len() > 1 && args[1] == "--list-presets" {
-        // List all available presets
-        println!("Available presets:");
-        for preset in neatflix_mpvrs::list_available_presets() {
-            if let Some(details) = neatflix_mpvrs::get_preset_details(&preset) {
-                println!("  {} - {}", preset, details.description);
-            } else {
-                println!("  {}", preset);
+    let mut media_path = None;
+    let mut preset_name = None;
+    let mut with_ipc = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--list-presets" => {
+                // List available presets
+                println!("Available presets:");
+                for preset in neatflix_mpvrs::list_available_presets() {
+                    println!("  - {}", preset);
+                }
+                return;
+            }
+            "--preset" => {
+                if i + 1 < args.len() {
+                    preset_name = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "--ipc" => {
+                with_ipc = true;
+            }
+            _ => {
+                if media_path.is_none() {
+                    media_path = Some(args[i].clone());
+                }
             }
         }
-        std::process::exit(0);
+        i += 1;
     }
-    
-    let media = if args.len() > 1 {
-        &args[1]
-    } else {
-        println!("Usage: neatflix-mpvrs <media_file_or_url> [--preset=<preset_name>] [other mpv options]");
-        println!("       neatflix-mpvrs --list-presets");
-        println!("No media file specified. Please provide a media file path or URL.");
+
+    if media_path.is_none() {
+        error!("No media path provided. Usage: {} <media_path> [--preset <preset_name>] [--ipc]", args[0]);
         std::process::exit(1);
-    };
-    
-    // Check if a preset is specified
-    let mut preset_name = None;
-    let mut extra_args = Vec::new();
-    let mut enable_ipc_control = false;
-    
-    for arg in args.iter().skip(2) {
-        if arg.starts_with("--preset=") {
-            preset_name = Some(arg.trim_start_matches("--preset=").to_string());
-        } else if arg == "--auto-preset" {
-            // Use the recommended preset based on system detection
-            info!("Detecting system for auto-preset...");
-            let recommended = neatflix_mpvrs::get_recommended_preset();
-            preset_name = Some(recommended);
-            info!("Using recommended preset: {}", preset_name.as_ref().unwrap());
-        } else if arg == "--ipc-control" {
-            enable_ipc_control = true;
-        } else {
-            extra_args.push(arg.as_str());
-        }
     }
+
+    // Launch mpv with or without preset
+    let media_path = media_path.unwrap();
     
-    info!("Playing media: {}", media);
-    
-    // Launch mpv with or without a preset
-    let result = if let Some(preset) = preset_name {
-        info!("Using preset: {}", preset);
-        neatflix_mpvrs::spawn_mpv_with_preset(media, Some(&preset), &extra_args)
-    } else {
-        neatflix_mpvrs::spawn_mpv(media, &extra_args)
-    };
-    
-    // Handle the result and set up IPC if requested
-    match result {
-        Ok((process, socket_path)) => {
-            info!("MPV process spawned with PID: {:?}", process.id());
+    if with_ipc {
+        info!("Launching media with IPC control: {}", media_path);
+        
+        // Create a tokio runtime for async operations
+        let rt = match Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                error!("Failed to create tokio runtime: {}", e);
+                std::process::exit(1);
+            }
+        };
+        
+        // Create video manager with IPC
+        let video_manager = VideoManager::new();
+        
+        // Set up event listener for video events
+        let mut subscription = rt.block_on(async {
+            video_manager.subscribe().await
+        });
+        
+        // Start thread to monitor video events
+        let video_closed = Arc::new(Mutex::new(false));
+        let video_closed_clone = Arc::clone(&video_closed);
+        
+        thread::spawn(move || {
+            info!("Event monitoring thread started");
             
-            if enable_ipc_control {
-                info!("IPC control enabled, socket path: {}", socket_path);
-                
-                // Give mpv some time to start up
-                thread::sleep(Duration::from_secs(1));
-                
-                // Connect to the IPC socket
-                match neatflix_mpvrs::connect_ipc(&socket_path) {
-                    Ok(ipc_client) => {
-                        info!("Connected to MPV IPC socket");
-                        
-                        // Create an event listener
-                        let mut event_listener = neatflix_mpvrs::create_event_listener(ipc_client);
-                        
-                        // Subscribe to time position changes
-                        if let Err(e) = event_listener.subscribe("property:time-pos", |event| {
-                            if let MpvEvent::PropertyChanged(property, value) = &event {
-                                info!("Playback position: {} = {:?}", property, value);
+            // Create a runtime for this thread
+            let thread_rt = match Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    error!("Failed to create thread runtime: {}", e);
+                    return;
+                }
+            };
+            
+            // Process events in a loop
+            thread_rt.block_on(async {
+                while let Some(event) = subscription.recv().await {
+                    match event {
+                        VideoEvent::Started { id } => info!("Video started: {:?}", id),
+                        VideoEvent::Paused { id } => info!("Video paused: {:?}", id),
+                        VideoEvent::Resumed { id } => info!("Video resumed: {:?}", id),
+                        VideoEvent::Ended { id } => {
+                            info!("Video ended: {:?}", id);
+                            // Set the closed flag
+                            if let Ok(mut closed) = video_closed.lock() {
+                                *closed = true;
                             }
-                        }) {
-                            error!("Error subscribing to time position events: {}", e);
-                        }
-                        
-                        // Subscribe to playback state changes
-                        if let Err(e) = event_listener.subscribe("property:pause", |event| {
-                            match event {
-                                MpvEvent::PlaybackPaused => info!("Playback paused"),
-                                MpvEvent::PlaybackResumed => info!("Playback resumed"),
-                                _ => {}
+                        },
+                        VideoEvent::Closed { id } => {
+                            info!("Video closed: {:?}", id);
+                            // Set the closed flag
+                            if let Ok(mut closed) = video_closed.lock() {
+                                *closed = true;
                             }
-                        }) {
-                            error!("Error subscribing to pause events: {}", e);
+                        },
+                        VideoEvent::Error { id, message } => error!("Video error for {:?}: {}", id, message),
+                        VideoEvent::Progress { id, position, duration, percent } => {
+                            debug!("Video progress: {:?} - {:.1}/{:.1} ({:.1}%)", 
+                                id, position, duration, percent * 100.0);
                         }
-                        
-                        // Start listening for events
-                        if let Err(e) = event_listener.start_listening() {
-                            error!("Error starting event listener: {}", e);
-                        } else {
-                            info!("Event listener started");
-                            
-                            // Wait for the process to exit
-                            let _ = process.wait_with_output();
-                        }
-                    },
-                    Err(e) => {
-                        error!("Error connecting to mpv IPC: {}", e);
                     }
                 }
-            } else {
-                // Just wait for the process to exit
-                let _ = process.wait_with_output();
+            });
+            
+            info!("Event monitoring thread completed");
+        });
+        
+        // Start playback
+        let mut playback_options = PlaybackOptions::default();
+        
+        if let Some(preset) = preset_name {
+            info!("Using preset: {}", preset);
+            playback_options.preset = Some(preset);
+        }
+        
+        // Start playback and get process
+        let video_id = match rt.block_on(async {
+            video_manager.play(media_path.to_string(), playback_options).await
+        }) {
+            Ok(id) => id,
+            Err(e) => {
+                error!("Failed to play media: {}", e);
+                std::process::exit(1);
             }
-        },
-        Err(e) => {
-            error!("Error launching video player: {}", e);
-            std::process::exit(1);
+        };
+        
+        info!("Started playback with video ID: {:?}", video_id);
+        
+        // Monitor for video closure or process exit
+        let mut should_exit = false;
+        while !should_exit {
+            // Check if video was closed by event
+            if let Ok(closed) = video_closed_clone.lock() {
+                if *closed {
+                    info!("Video closed detected from events");
+                    should_exit = true;
+                }
+            }
+            
+            // Sleep before checking again
+            thread::sleep(Duration::from_millis(500));
+        }
+        
+        // Clean up
+        info!("Cleaning up resources");
+        rt.block_on(async {
+            if let Err(e) = video_manager.close(video_id).await {
+                error!("Error closing video: {}", e);
+            }
+            
+            if let Err(e) = video_manager.close_all().await {
+                error!("Error closing video manager: {}", e);
+            }
+        });
+    } else {
+        // Just launch mpv without IPC control
+        info!("Launching media without IPC control: {}", media_path);
+        
+        let result = if let Some(preset) = preset_name {
+            info!("Using preset: {}", preset);
+            neatflix_mpvrs::spawn_mpv_with_preset(&media_path, Some(&preset), &[])
+        } else {
+            neatflix_mpvrs::spawn_mpv(&media_path, &[])
+        };
+        
+        match result {
+            Ok((process, socket_path)) => {
+                info!("MPV process spawned with socket: {}", socket_path);
+                
+                let process = Arc::new(Mutex::new(process));
+                
+                // Create IPC client for monitoring
+                let ipc_client = match neatflix_mpvrs::connect_ipc(&socket_path) {
+                    Ok(client) => {
+                        info!("Connected to MPV IPC socket");
+                        Some(client)
+                    },
+                    Err(e) => {
+                        error!("Error connecting to IPC socket: {}", e);
+                        None
+                    }
+                };
+                
+                // Create event listener if IPC client is available
+                let event_listener = ipc_client.map(|client| {
+                    let listener = neatflix_mpvrs::create_event_listener(client);
+                    Arc::new(Mutex::new(listener))
+                });
+                
+                // Monitor the process and wait for it to exit
+                monitor_process(process, event_listener);
+            },
+            Err(e) => {
+                error!("Failed to launch mpv: {}", e);
+                std::process::exit(1);
+            }
         }
     }
+    
+    info!("Application exiting");
 }

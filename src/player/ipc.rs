@@ -54,90 +54,111 @@ impl MpvIpcClient {
     pub fn connect_with_config(socket_path: &str, config: IpcConfig) -> Result<Self> {
         debug!("Connecting to mpv IPC socket: {}", socket_path);
         
-        #[cfg(target_family = "unix")]
-        {
-            match UnixStream::connect(socket_path) {
-                Ok(socket) => {
-                    debug!("Successfully connected to mpv IPC socket");
-                    Ok(Self { 
-                        socket, 
-                        request_id: 1, 
-                        connected: true,
-                        socket_path: socket_path.to_string(),
-                        config,
-                        reconnect_attempts: 0,
-                        last_reconnect_time: None,
-                        intentionally_closed: false,
-                    })
-                },
-                Err(e) => {
-                    error!("Failed to connect to mpv IPC socket: {}", e);
-                    Err(Error::Io(e))
-                }
-            }
-        }
+        let mut attempts = 0;
+        let max_attempts = config.max_reconnect_attempts;
+        let mut delay_ms = config.reconnect_delay_ms;
         
-        #[cfg(target_family = "windows")]
-        {
-            // Windows named pipe implementation
-            let c_socket_path = match CString::new(socket_path) {
-                Ok(path) => path,
-                Err(e) => {
-                    error!("Failed to convert socket path to CString: {}", e);
-                    return Err(Error::MpvError(format!("Invalid socket path: {}", e)));
+        // Retry loop for initial connection
+        loop {
+            // Check if socket file exists before attempting to connect (Unix only)
+            #[cfg(target_family = "unix")]
+            {
+                let socket_path_exists = std::path::Path::new(socket_path).exists();
+                if !socket_path_exists && attempts > 0 {
+                    debug!("Socket path does not exist yet, waiting for mpv to create it. Attempt {}/{}", 
+                           attempts + 1, max_attempts);
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    attempts += 1;
+                    delay_ms = std::cmp::min(delay_ms * 2, 1000); // Exponential backoff, capped at 1 second
+                    
+                    if attempts >= max_attempts {
+                        return Err(Error::MpvError(format!("Socket path not found after {} attempts", max_attempts)));
+                    }
+                    continue;
                 }
-            };
-            
-            let handle = unsafe {
-                CreateFileA(
-                    c_socket_path.as_ptr(),
-                    GENERIC_READ | GENERIC_WRITE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    ptr::null_mut(),
-                    winapi::um::fileapi::OPEN_EXISTING,
-                    FILE_FLAG_OVERLAPPED,
-                    ptr::null_mut(),
-                )
-            };
-            
-            if handle == winapi::um::handleapi::INVALID_HANDLE_VALUE {
-                let err = io::Error::last_os_error();
-                error!("Failed to open named pipe: {}", err);
-                return Err(Error::Io(err));
             }
             
-            let socket = unsafe { std::fs::File::from_raw_handle(handle as *mut _) };
-            debug!("Successfully connected to MPV IPC socket");
+            #[cfg(target_family = "unix")]
+            {
+                match UnixStream::connect(socket_path) {
+                    Ok(socket) => {
+                        debug!("Successfully connected to mpv IPC socket");
+                        return Ok(Self { 
+                            socket, 
+                            request_id: 1, 
+                            connected: true,
+                            socket_path: socket_path.to_string(),
+                            config,
+                            reconnect_attempts: 0,
+                            last_reconnect_time: None,
+                            intentionally_closed: false,
+                        });
+                    },
+                    Err(e) => {
+                        if attempts >= max_attempts {
+                            error!("Failed to connect to mpv IPC socket after {} attempts: {}", max_attempts, e);
+                            return Err(Error::Io(e));
+                        }
+                        
+                        debug!("Failed to connect to mpv IPC socket, retrying ({}/{}): {}", 
+                               attempts + 1, max_attempts, e);
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        attempts += 1;
+                        delay_ms = std::cmp::min(delay_ms * 2, 1000); // Exponential backoff, capped at 1 second
+                    }
+                }
+            }
             
-            Ok(Self {
-                socket,
-                request_id: 1,
-                connected: true,
-                socket_path: socket_path.to_string(),
-                config,
-                reconnect_attempts: 0,
-                last_reconnect_time: None,
-                intentionally_closed: false,
-            })
+            #[cfg(target_family = "windows")]
+            {
+                match std::fs::OpenOptions::new().read(true).write(true).open(socket_path) {
+                    Ok(socket) => {
+                        debug!("Successfully connected to mpv IPC socket");
+                        return Ok(Self { 
+                            socket, 
+                            request_id: 1, 
+                            connected: true,
+                            socket_path: socket_path.to_string(),
+                            config,
+                            reconnect_attempts: 0,
+                            last_reconnect_time: None,
+                            intentionally_closed: false,
+                        });
+                    },
+                    Err(e) => {
+                        if attempts >= max_attempts {
+                            error!("Failed to connect to mpv IPC socket after {} attempts: {}", max_attempts, e);
+                            return Err(Error::Io(e));
+                        }
+                        
+                        debug!("Failed to connect to mpv IPC socket, retrying ({}/{}): {}", 
+                               attempts + 1, max_attempts, e);
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        attempts += 1;
+                        delay_ms = std::cmp::min(delay_ms * 2, 1000); // Exponential backoff, capped at 1 second
+                    }
+                }
+            }
         }
     }
     
     /// Attempts to reconnect to the mpv socket if disconnected
     fn reconnect(&mut self) -> Result<()> {
+        // Always check intentionally_closed first before any other logic
         if self.intentionally_closed {
             debug!("Not reconnecting because client was intentionally closed");
             return Err(Error::MpvError("Client was intentionally closed".to_string()));
         }
 
-        // Log the reconnection attempt and current state
-        debug!("Attempting to reconnect to mpv IPC socket. Attempt: {}/{}, intentionally_closed: {}", 
-               self.reconnect_attempts + 1, 
-               self.config.max_reconnect_attempts,
-               self.intentionally_closed);
-
+        // If already connected, nothing to do
         if self.connected {
             return Ok(());
         }
+        
+        // Log the reconnection attempt and current state
+        debug!("Attempting to reconnect to mpv IPC socket. Attempt: {}/{}", 
+               self.reconnect_attempts + 1, 
+               self.config.max_reconnect_attempts);
         
         // Check if we've reached the maximum number of reconnection attempts
         if self.reconnect_attempts >= self.config.max_reconnect_attempts {
@@ -160,55 +181,73 @@ impl MpvIpcClient {
             }
         }
         
+        // Update last reconnection time
         self.last_reconnect_time = Some(now);
         
-        debug!("Attempting to reconnect to mpv IPC socket (attempt {}/{})", 
-              self.reconnect_attempts, self.config.max_reconnect_attempts);
+        // Check if the socket file even exists before trying to connect (Unix only)
+        #[cfg(target_family = "unix")]
+        {
+            let socket_path = std::path::Path::new(&self.socket_path);
+            if !socket_path.exists() {
+                debug!("Socket path does not exist, mpv process has likely terminated");
+                // Mark as intentionally closed since mpv is gone
+                self.intentionally_closed = true;
+                return Err(Error::MpvError("Socket file does not exist, mpv process has likely terminated".to_string()));
+            }
+        }
         
+        // Attempt to reconnect
         #[cfg(target_family = "unix")]
         {
             match UnixStream::connect(&self.socket_path) {
-                Ok(new_socket) => {
-                    self.socket = new_socket;
+                Ok(socket) => {
+                    self.socket = socket;
                     self.connected = true;
+                    self.reset_reconnect_attempts();
                     debug!("Successfully reconnected to mpv IPC socket");
-                    Ok(())
+                    return Ok(());
                 },
                 Err(e) => {
                     error!("Failed to reconnect to mpv IPC socket: {}", e);
-                    Err(Error::Io(e))
+                    
+                    // If connection refused, mpv has likely terminated
+                    if let Some(os_err) = e.raw_os_error() {
+                        // ECONNREFUSED
+                        if os_err == 61 || os_err == 111 {
+                            debug!("Connection refused, mpv process has likely terminated");
+                            // Mark as intentionally closed since mpv is gone
+                            self.intentionally_closed = true;
+                        }
+                    }
+                    
+                    return Err(Error::Io(e));
                 }
             }
         }
         
         #[cfg(target_family = "windows")]
         {
-            let socket_path_cstring = std::ffi::CString::new(self.socket_path.clone())
-                .map_err(|e| Error::MpvError(format!("Invalid socket path: {}", e)))?;
-            
-            let handle = unsafe {
-                CreateFileA(
-                    socket_path_cstring.as_ptr(),
-                    GENERIC_READ | GENERIC_WRITE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    std::ptr::null_mut(),
-                    winapi::um::fileapi::OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL,
-                    std::ptr::null_mut(),
-                )
-            };
-            
-            if handle == winapi::um::handleapi::INVALID_HANDLE_VALUE {
-                let err = std::io::Error::last_os_error();
-                error!("Failed to reconnect to mpv IPC socket: {}", err);
-                return Err(Error::Io(err));
+            match std::fs::OpenOptions::new().read(true).write(true).open(&self.socket_path) {
+                Ok(socket) => {
+                    self.socket = socket;
+                    self.connected = true;
+                    self.reset_reconnect_attempts();
+                    debug!("Successfully reconnected to mpv IPC socket");
+                    return Ok(());
+                },
+                Err(e) => {
+                    error!("Failed to reconnect to mpv IPC socket: {}", e);
+                    
+                    // Check for specific errors that indicate the pipe is gone
+                    if e.kind() == std::io::ErrorKind::NotFound || e.kind() == std::io::ErrorKind::ConnectionRefused {
+                        debug!("Named pipe not found or connection refused, mpv process has likely terminated");
+                        // Mark as intentionally closed since mpv is gone
+                        self.intentionally_closed = true;
+                    }
+                    
+                    return Err(Error::Io(e));
+                }
             }
-            
-            let new_socket = unsafe { std::fs::File::from_raw_handle(handle as *mut _) };
-            self.socket = new_socket;
-            self.connected = true;
-            debug!("Successfully reconnected to mpv IPC socket");
-            Ok(())
         }
     }
     
@@ -428,54 +467,51 @@ impl MpvIpcClient {
     
     /// Checks if we should attempt to reconnect based on the error
     fn should_reconnect(&self, error: &Error) -> bool {
+        // Always honor intentionally_closed flag
         if self.intentionally_closed {
             debug!("Not reconnecting because client was intentionally closed");
             return false;
         }
 
-        // Check for EOF-related errors that indicate intentional closure
-        let is_eof_error = match error {
+        // Check for common socket errors that indicate the process has terminated
+        let is_terminal_error = match error {
+            // Broken pipe typically means the process has already exited
+            Error::Io(err) if err.kind() == std::io::ErrorKind::BrokenPipe => true,
+            
+            // Connection refused means the socket is no longer available
+            Error::Io(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => true,
+            
+            // Connection reset indicates the process has terminated
+            Error::Io(err) if err.kind() == std::io::ErrorKind::ConnectionReset => true,
+            
+            // EOF-related errors
             Error::MpvError(msg) if msg.contains("End of file") => true,
+            
+            // Property unavailable often happens during shutdown
             Error::MpvError(msg) if msg.contains("property unavailable") && self.connected => {
-                // This often happens when mpv is shutting down
                 debug!("Detected property unavailable error during connected state, treating as EOF");
                 true
-            }
+            },
+            
             _ => false,
         };
 
-        if is_eof_error {
-            debug!("Not reconnecting because EOF-related error detected: {}", error);
+        if is_terminal_error {
+            debug!("Not reconnecting because terminal error detected: {}", error);
             return false;
         }
 
-        if self.reconnect_attempts >= self.config.max_reconnect_attempts {
-            debug!("Not reconnecting because max reconnect attempts ({}) reached", 
-                   self.config.max_reconnect_attempts);
-            return false;
-        }
-
-        // Check if auto-reconnect is enabled
-        if !self.config.auto_reconnect {
-            debug!("Not reconnecting because auto-reconnect is disabled");
-            return false;
-        }
-
-        // Check if the error is reconnectable
-        let reconnectable = match error {
-            Error::Io(_) => true,
-            Error::MpvError(msg) if msg.contains("Connection refused") => true,
-            Error::MpvError(msg) if msg.contains("Broken pipe") => true,
-            Error::MpvError(msg) if msg.contains("Connection reset") => true,
-            _ => false,
-        };
-
-        debug!("Should reconnect for error: {}? {}", error, reconnectable);
-        reconnectable
+        // Other errors might be transient, so reconnect
+        true
     }
     
     /// Sends a request to mpv with improved error handling
     fn send_request(&mut self, request: &Value) -> Result<()> {
+        // First check if the client was intentionally closed
+        if self.intentionally_closed {
+            return Err(Error::MpvError("Client was intentionally closed".to_string()));
+        }
+
         if !self.connected {
             if self.config.auto_reconnect {
                 self.reconnect()?;
@@ -596,21 +632,66 @@ impl MpvIpcClient {
         Err(Error::MpvError(format!("No response found for request ID {}", request_id)))
     }
     
-    /// Checks if the mpv process is running by sending a simple command
+    /// Returns whether mpv is still running
     pub fn is_running(&mut self) -> bool {
-        if !self.connected && self.config.auto_reconnect {
-            if let Err(e) = self.reconnect() {
-                debug!("Failed to reconnect while checking if mpv is running: {}", e);
+        // If the client was intentionally closed, assume mpv is not running
+        if self.intentionally_closed {
+            debug!("is_running: client was intentionally closed, assuming mpv is not running");
+            return false;
+        }
+        
+        // If not connected, try to reconnect if enabled
+        if !self.connected {
+            if self.config.auto_reconnect {
+                debug!("is_running: not connected, attempting to reconnect");
+                if let Err(e) = self.reconnect() {
+                    debug!("Failed to reconnect while checking if mpv is running: {}", e);
+                    return false;
+                }
+            } else {
+                debug!("is_running: not connected and auto-reconnect disabled");
                 return false;
             }
         }
         
-        match self.get_property("pid") {
-            Ok(_) => true,
-            Err(e) => {
-                debug!("mpv is not running: {}", e);
-                false
-            }
+        // Try multiple properties to determine if mpv is running
+        let pid_check = self.get_property("pid").is_ok();
+        let path_check = self.get_property("path").is_ok();
+        
+        // Check if playback is idle (which can indicate player is about to exit)
+        let idle_active = match self.get_property("idle-active") {
+            Ok(value) => value.as_bool().unwrap_or(false),
+            Err(_) => false,
+        };
+        
+        // Check if EOF has been reached
+        let eof_reached = match self.get_property("eof-reached") {
+            Ok(value) => value.as_bool().unwrap_or(false),
+            Err(_) => false,
+        };
+        
+        // Check process state directly with a simple command
+        let cmd_check = self.command("get_version", &[]).is_ok();
+        
+        debug!("is_running checks: pid={}, path={}, cmd={}, idle={}, eof={}", 
+               pid_check, path_check, cmd_check, idle_active, eof_reached);
+        
+        // If basic checks pass but idle or EOF indicate termination, assume process is ending
+        if (pid_check || path_check || cmd_check) && (idle_active || eof_reached) {
+            debug!("Process detected as ending (idle={}, eof={})", idle_active, eof_reached);
+            // Give the process a chance to exit cleanly, but mark as intentionally closed
+            self.mark_as_intentionally_closed();
+            return false;
+        }
+        
+        // If any check passes, mpv is probably running
+        if pid_check || path_check || cmd_check {
+            true
+        } else {
+            // Mark as intentionally closed to prevent further reconnection attempts
+            debug!("All running checks failed, marking client as intentionally closed");
+            self.mark_as_intentionally_closed();
+            false
         }
     }
     
@@ -619,12 +700,39 @@ impl MpvIpcClient {
         self.connected
     }
     
-    /// Explicitly marks the connection as closed
+    /// Closes the connection to mpv.
     pub fn close(&mut self) {
-        if self.connected {
-            debug!("Closing connection to mpv IPC socket");
-            self.connected = false;
+        debug!("Explicitly closing IPC client connection");
+        // Set the intentionally_closed flag first before any other operations
+        self.intentionally_closed = true;
+        
+        #[cfg(target_family = "unix")]
+        {
+            // First try to properly close the socket
+            let _ = self.socket.shutdown(std::net::Shutdown::Both);
+            
+            // Additionally, invalidate the connection by dropping and recreating it
+            // This ensures any pending operations will fail immediately
+            if let Ok(mut socket) = UnixStream::connect("/dev/null") {
+                std::mem::swap(&mut self.socket, &mut socket);
+                // Original socket is dropped here
+            }
         }
+        
+        #[cfg(target_family = "windows")]
+        {
+            // On Windows, we can't easily invalidate the connection,
+            // but we can at least set the connected flag
+        }
+        
+        // Reset any reconnection state
+        self.reconnect_attempts = 0;
+        self.last_reconnect_time = None;
+        
+        // Update connected status
+        self.connected = false;
+        
+        debug!("IPC client connection closed and marked as intentionally closed");
     }
     
     /// Gets the current playback time in seconds
@@ -919,7 +1027,10 @@ impl MpvIpcClient {
     
     /// Quits mpv
     pub fn quit(&mut self) -> Result<Value> {
-        self.command("quit", &[])
+        let result = self.command("quit", &[]);
+        // Mark as intentionally closed after sending quit command
+        self.mark_as_intentionally_closed();
+        result
     }
     
     /// Gets the current playback status (playing, paused, idle)
@@ -948,5 +1059,10 @@ impl MpvIpcClient {
     /// Returns the configured poll interval in milliseconds
     pub fn get_poll_interval(&self) -> u64 {
         self.config.poll_interval_ms
+    }
+    
+    /// Returns whether the client has been intentionally closed
+    pub fn is_intentionally_closed(&self) -> bool {
+        self.intentionally_closed
     }
 } 

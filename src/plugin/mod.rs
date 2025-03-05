@@ -6,6 +6,7 @@ use tokio::task::JoinHandle as TokioJoinHandle;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use log::debug;
 
 use crate::player::events::MpvEventListener;
 use crate::player::ipc::MpvIpcClient;
@@ -61,6 +62,8 @@ pub struct PlaybackOptions {
     pub progress_interval_ms: Option<u64>,
     /// Window configuration options
     pub window: Option<WindowOptions>,
+    /// Connection timeout in milliseconds
+    pub connection_timeout_ms: Option<u64>,
 }
 
 impl Default for PlaybackOptions {
@@ -73,6 +76,7 @@ impl Default for PlaybackOptions {
             report_progress: true,
             progress_interval_ms: Some(1000),
             window: None,
+            connection_timeout_ms: None,
         }
     }
 }
@@ -134,18 +138,40 @@ struct VideoInstance {
 
 impl Drop for VideoInstance {
     fn drop(&mut self) {
-        // Attempt to quit mpv gracefully
-        if let Some(mut client) = self.ipc_client.lock().ok() {
-            let _ = client.quit();
+        debug!("Dropping VideoInstance with ID: {}", self.id.to_string());
+        
+        // First, stop the event listener to prevent any further IPC communication
+        if let Some(mut event_listener) = self.event_listener.take() {
+            debug!("Stopping event listener for video {}", self.id.to_string());
+            let _ = event_listener.stop_listening();
+            let _ = event_listener.handle_process_exit();
         }
+
+        // Attempt to quit mpv gracefully and mark IPC as intentionally closed
+        if let Some(mut client) = self.ipc_client.lock().ok() {
+            debug!("Sending quit command to mpv for video {}", self.id.to_string());
+            // quit() now marks the connection as intentionally closed
+            let _ = client.quit();
+            
+            // For extra safety, explicitly close the connection
+            client.close();
+        }
+        
+        // Wait briefly for process to exit gracefully
+        use std::thread::sleep;
+        use std::time::Duration;
+        sleep(Duration::from_millis(100));
         
         // Kill the process if it's still running
         let _ = self.process.kill();
         
         // Join the event thread if it exists
         if let Some(thread) = self.event_thread.take() {
+            debug!("Joining event thread for video {}", self.id.to_string());
             let _ = thread.join();
         }
+        
+        debug!("VideoInstance with ID {} successfully dropped", self.id.to_string());
     }
 }
 
@@ -176,24 +202,86 @@ impl VideoManager {
             // Convert PlaybackOptions to SpawnOptions
             let spawn_options = crate::player::process::SpawnOptions::from(&options);
             
-            // Launch mpv with the specified source and options
-            let (process, socket_path) = crate::player::process::spawn_mpv(&source, &spawn_options)?;
-            
-            // Connect to mpv via IPC
-            let ipc_client = crate::connect_ipc(&socket_path)?;
-            let ipc_client = Arc::new(Mutex::new(ipc_client));
-            
-            // Create a unique ID for this instance
+            // Generate a unique ID for this instance
             let id = VideoId::new();
+            
+            // Launch mpv with the specified source and options
+            let (mut process, socket_path) = crate::player::process::spawn_mpv(&source, &spawn_options)?;
+            
+            debug!("MPV process started, socket path: {}", socket_path);
+            
+            // Build an enhanced IPC config with more aggressive initial connection attempts
+            let ipc_config = if let Some(timeout) = options.connection_timeout_ms {
+                crate::config::ipc::IpcConfig::new(
+                    timeout,
+                    options.progress_interval_ms.unwrap_or(1000),
+                    true,
+                    10, // More attempts for initial connection
+                    250, // Faster retry for initial connection
+                )
+            } else {
+                crate::config::ipc::IpcConfig::default()
+            };
+            
+            // Connect to mpv via IPC (with retry logic handled inside connect_with_config)
+            debug!("Connecting to mpv IPC socket...");
+            let ipc_client = match crate::player::ipc::MpvIpcClient::connect_with_config(&socket_path, ipc_config.clone()) {
+                Ok(client) => client,
+                Err(e) => {
+                    // If we can't connect, make sure to clean up the process
+                    debug!("Failed to connect to mpv IPC socket, killing process: {}", e);
+                    let _ = process.kill();
+                    return Err(e);
+                }
+            };
+            
+            let ipc_client = Arc::new(Mutex::new(ipc_client));
             
             // Create event listener if progress reporting is enabled
             let (event_listener, event_thread) = if options.report_progress {
                 // Create a new IPC client for the event listener
-                let event_ipc_client = crate::connect_ipc(&socket_path)?;
-                let mut listener = crate::create_event_listener(event_ipc_client);
+                debug!("Setting up event listener for progress reporting");
+                let event_ipc_client = match crate::player::ipc::MpvIpcClient::connect_with_config(&socket_path, ipc_config) {
+                    Ok(client) => client,
+                    Err(e) => {
+                        debug!("Failed to connect event listener to mpv IPC socket: {}", e);
+                        // Still return success, but without event listening
+                        let instance = VideoInstance {
+                            id,
+                            process,
+                            ipc_client,
+                            event_listener: None,
+                            event_thread: None,
+                            socket_path,
+                        };
+                        
+                        let mut instances = instances.lock().unwrap();
+                        instances.insert(id, instance);
+                        
+                        return Ok(id);
+                    }
+                };
+                
+                let mut listener = crate::player::events::MpvEventListener::new(event_ipc_client);
                 
                 // Start the listener
-                listener.start_listening()?;
+                if let Err(e) = listener.start_listening() {
+                    debug!("Failed to start event listener: {}", e);
+                    // Continue without event listening
+                    let instance = VideoInstance {
+                        id,
+                        process,
+                        ipc_client,
+                        event_listener: None,
+                        event_thread: None,
+                        socket_path,
+                    };
+                    
+                    let mut instances = instances.lock().unwrap();
+                    instances.insert(id, instance);
+                    
+                    return Ok(id);
+                }
                 
                 // Set up event forwarding
                 let video_id = id;
@@ -231,34 +319,48 @@ impl VideoManager {
     /// Closes a specific video
     pub async fn close(&self, id: VideoId) -> Result<()> {
         let instances = self.instances.clone();
+        let subscribers = self.event_subscribers.clone();
         
         // Spawn a blocking task to close the video
         tokio::task::spawn_blocking(move || {
+            debug!("Closing video with ID: {}", id.to_string());
             let mut instances = instances.lock().unwrap();
             
             if let Some(mut instance) = instances.remove(&id) {
                 // Stop the event listener if it exists
                 if let Some(mut listener) = instance.event_listener.take() {
+                    debug!("Stopping event listener for video {}", id.to_string());
                     let _ = listener.stop_listening();
+                    let _ = listener.handle_process_exit();
                 }
                 
-                // Attempt to quit mpv gracefully
-                if let Ok(mut client) = instance.ipc_client.lock() {
+                // Mark the IPC client as intentionally closed
+                if let Some(mut client) = instance.ipc_client.lock().ok() {
+                    debug!("Sending quit command to mpv for video {}", id.to_string());
+                    // This will mark the client as intentionally closed
                     let _ = client.quit();
+                    
+                    // For extra safety, explicitly close the connection
+                    client.close();
                 }
+                
+                // Wait briefly for mpv to process the quit command
+                use std::thread::sleep;
+                use std::time::Duration;
+                sleep(Duration::from_millis(100));
                 
                 // Kill the process if it's still running
                 let _ = instance.process.kill();
                 
-                // Join the event thread if it exists
-                if let Some(thread) = instance.event_thread.take() {
-                    let _ = thread.join();
-                }
+                // Notify subscribers that the video was closed
+                Self::notify_subscribers(&subscribers, VideoEvent::Closed { id });
                 
-                Ok(())
+                debug!("Video {} closed successfully", id.to_string());
             } else {
-                Err(crate::Error::MpvError(format!("No video instance with ID {}", id.to_string())))
+                debug!("Video {} not found for closing", id.to_string());
             }
+            
+            Ok(())
         }).await.unwrap()
     }
     
@@ -352,21 +454,77 @@ impl VideoManager {
         let interval = Duration::from_millis(interval_ms);
         let mut last_position = -1.0;
         let mut last_paused = false;
+        let mut consecutive_errors = 0;
+        let mut playback_status = String::new();  // Track playback status
         
         loop {
             // Sleep for the specified interval
             thread::sleep(interval);
             
-            // Get the current playback state
-            let position = if let Ok(mut client) = ipc_client.lock() {
-                if let Ok(value) = client.get_property("time-pos") {
-                    value.as_f64()
-                } else {
-                    None
+            // Check if the ipc client is connected
+            let is_running = if let Ok(mut client) = ipc_client.lock() {
+                client.is_running()
+            } else {
+                false
+            };
+            
+            // If process is not running, break out of the loop
+            if !is_running {
+                debug!("MPV process is no longer running for video {}", id.to_string());
+                Self::notify_subscribers(&subscribers, VideoEvent::Closed { id });
+                break;
+            }
+            
+            // Check current playback status - useful for detecting OSC-triggered actions
+            let current_status = if let Ok(mut client) = ipc_client.lock() {
+                match client.get_playback_status() {
+                    Ok(status) => status,
+                    Err(_) => String::new()
                 }
             } else {
+                String::new()
+            };
+            
+            // If playback status changes to "stopped" or "idle", it might indicate
+            // the user has closed the player via OSC
+            if !current_status.is_empty() && current_status != playback_status {
+                debug!("Playback status changed from '{}' to '{}' for video {}", 
+                       playback_status, current_status, id.to_string());
+                
+                // If status indicates player is stopping
+                if current_status == "idle" || current_status == "stopped" {
+                    debug!("Detected player stopping via OSC controls for video {}", id.to_string());
+                    Self::notify_subscribers(&subscribers, VideoEvent::Closed { id });
+                    break;
+                }
+                
+                playback_status = current_status;
+            }
+            
+            // Get the current playback state
+            let position = if let Ok(mut client) = ipc_client.lock() {
+                match client.get_property("time-pos") {
+                    Ok(value) => {
+                        consecutive_errors = 0; // Reset error counter on success
+                        value.as_f64()
+                    },
+                    Err(e) => {
+                        debug!("Error getting time-pos: {:?}", e);
+                        consecutive_errors += 1;
+                        None
+                    }
+                }
+            } else {
+                consecutive_errors += 1;
                 None
             };
+            
+            // If we have too many consecutive errors, assume the process has terminated
+            if consecutive_errors > 3 {  // Reduced from 5 to 3 for faster detection
+                debug!("Too many consecutive errors, assuming mpv has terminated for video {}", id.to_string());
+                Self::notify_subscribers(&subscribers, VideoEvent::Closed { id });
+                break;
+            }
             
             let duration = if let Ok(mut client) = ipc_client.lock() {
                 if let Ok(value) = client.get_property("duration") {
@@ -391,6 +549,17 @@ impl VideoManager {
             // Check if playback has ended
             let eof = if let Ok(mut client) = ipc_client.lock() {
                 if let Ok(value) = client.get_property("eof-reached") {
+                    value.as_bool().unwrap_or(false)
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            
+            // Additionally check for idle-active which indicates mpv is waiting for commands
+            let idle_active = if let Ok(mut client) = ipc_client.lock() {
+                if let Ok(value) = client.get_property("idle-active") {
                     value.as_bool().unwrap_or(false)
                 } else {
                     false
@@ -431,25 +600,20 @@ impl VideoManager {
             
             // Check if playback has ended
             if eof {
+                debug!("EOF reached for video {}", id.to_string());
                 Self::notify_subscribers(&subscribers, VideoEvent::Ended { id });
                 break;
             }
             
-            // Check if the process is still running
-            if let Ok(mut client) = ipc_client.lock() {
-                if let Ok(value) = client.get_property("idle-active") {
-                    if value.as_bool().unwrap_or(false) {
-                        // The file has been closed
-                        Self::notify_subscribers(&subscribers, VideoEvent::Closed { id });
-                        break;
-                    }
-                }
-            } else {
-                // IPC client is no longer available
+            // Check if the file has been closed
+            if idle_active {
+                debug!("Idle active detected for video {}", id.to_string());
                 Self::notify_subscribers(&subscribers, VideoEvent::Closed { id });
                 break;
             }
         }
+        
+        debug!("Playback monitoring completed for video {}", id.to_string());
     }
     
     /// Updates window properties for a video instance
