@@ -1,3 +1,6 @@
-mpv_config/scripts/
+mpv_config/scripts/uosc/bin/
+mpv_config/scripts/uosc/char-conv/
+mpv_config/scripts/uosc/elements/
+mpv_config/scripts/uosc/intl/
 mpv_config/watch_later/
 target/
