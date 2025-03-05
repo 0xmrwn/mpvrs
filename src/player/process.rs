@@ -6,6 +6,40 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use uuid::Uuid;
 use crate::player::events::MpvEventListener;
+use crate::plugin::WindowOptions;
+
+/// Options for spawning mpv
+#[derive(Debug, Clone, Default)]
+pub struct SpawnOptions {
+    /// Preset to use (default, high-quality, low-latency, etc.)
+    pub preset: Option<String>,
+    /// Additional mpv arguments
+    pub extra_args: Vec<String>,
+    /// Window configuration options
+    pub window: Option<WindowOptions>,
+}
+
+impl From<&crate::plugin::PlaybackOptions> for SpawnOptions {
+    fn from(options: &crate::plugin::PlaybackOptions) -> Self {
+        let mut extra_args = options.extra_args.clone();
+        
+        // Convert start_time to argument
+        if let Some(start_time) = options.start_time {
+            extra_args.push(format!("--start={}", start_time));
+        }
+        
+        // Convert title to argument
+        if let Some(title) = &options.title {
+            extra_args.push(format!("--title={}", title));
+        }
+        
+        Self {
+            preset: options.preset.clone(),
+            extra_args,
+            window: options.window.clone(),
+        }
+    }
+}
 
 /// Validates configuration files to ensure they don't have common issues
 /// like trailing spaces after boolean values
@@ -22,7 +56,9 @@ fn validate_config_files() -> Result<()> {
     }
     
     let config_files = vec![
-        "uosc.conf"
+        "uosc.conf",
+        "mpv.conf",
+        "input.conf"
     ];
     
     for file_name in config_files {
@@ -85,10 +121,77 @@ pub fn generate_socket_path() -> String {
     }
 }
 
-/// Spawns mpv with the specified media file or URL.
-/// Additional command-line arguments can override default configurations.
+/// Applies window options to mpv command arguments
+fn apply_window_options(args: &mut Vec<String>, window: &WindowOptions) {
+    // Apply borderless window mode
+    if window.borderless {
+        args.push("--border=no".to_string());
+        args.push("--no-window-decorations".to_string());
+    }
+    
+    // Build geometry string
+    let mut geometry = String::new();
+    
+    // Add size if specified
+    if let Some((width, height)) = window.size {
+        geometry.push_str(&format!("{}x{}", width, height));
+    }
+    
+    // Add position if specified
+    if let Some((x, y)) = window.position {
+        geometry.push_str(&format!("+{}+{}", x, y));
+    }
+    
+    // Apply geometry if not empty
+    if !geometry.is_empty() {
+        args.push(format!("--geometry={}", geometry));
+    }
+    
+    // Apply always on top
+    if window.always_on_top {
+        args.push("--ontop".to_string());
+    }
+    
+    // Apply window opacity
+    if let Some(opacity) = window.opacity {
+        // Clamp opacity between 0.0 and 1.0
+        let opacity = opacity.max(0.0).min(1.0);
+        args.push(format!("--alpha={}", opacity));
+    }
+    
+    // Apply hidden start
+    if window.start_hidden {
+        args.push("--force-window=yes".to_string());
+        args.push("--start-hidden".to_string());
+    }
+    
+    // Platform-specific options
+    #[cfg(target_os = "windows")]
+    {
+        // On Windows, add extra options for proper borderless windows if needed
+        if window.borderless {
+            args.push("--no-border".to_string());
+        }
+        
+        // Handle DPI awareness
+        args.push("--hidpi-window-scale=no".to_string());
+    }
+    
+    #[cfg(target_os = "linux")]
+    {
+        // On Linux, add X11-specific options if needed
+        if window.borderless {
+            args.push("--x11-name=mpv-borderless".to_string());
+        }
+    }
+}
+
+/// Spawns mpv with the specified media file or URL and options.
 /// Returns the process handle and socket path for IPC communication.
-pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> Result<(Child, String)> {
+pub fn spawn_mpv(
+    file_or_url: &str, 
+    options: &SpawnOptions
+) -> Result<(Child, String)> {
     info!("Launching mpv for media: {}", file_or_url);
     
     // Validate configuration files before launching mpv
@@ -100,16 +203,6 @@ pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> Result<(Child, Strin
     let socket_path = generate_socket_path();
     debug!("Generated IPC socket path: {}", socket_path);
 
-    // Build the argument list with key options:
-    // - Use uosc instead of standard OSC
-    // - Use our custom config directory
-    // - Enable the JSON IPC server
-    
-    // Create String values that will live for the entire function
-    let config_dir_path = get_mpv_config_path();
-    let config_dir_str = config_dir_path.to_str().unwrap().to_string();
-    debug!("MPV config directory: {}", config_dir_str);
-    
     // Build args using mpv's --option=value format
     let mut args = Vec::<String>::new();
     
@@ -117,27 +210,46 @@ pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> Result<(Child, Strin
     args.push("--msg-level=all=v".to_string());
     
     // Add configuration directory
-    args.push(format!("--config-dir={}", config_dir_str));
+    let config_dir_path = get_mpv_config_path();
+    args.push(format!("--config-dir={}", config_dir_path.to_str().unwrap()));
     
     // Ensure uosc is used instead of the standard OSC
     args.push("--osc=no".to_string());
     args.push("--osd-bar=no".to_string());
-    args.push("--border=no".to_string());
     
     // Enable the JSON IPC server
     args.push(format!("--input-ipc-server={}", socket_path));
     
-    // Add any extra arguments
-    for arg in extra_args {
-        args.push(arg.to_string());
+    // Apply preset if specified
+    if let Some(preset_name) = &options.preset {
+        match crate::presets::apply_preset(preset_name) {
+            Ok(preset_args) => {
+                debug!("Applying preset '{}' with args: {:?}", preset_name, preset_args);
+                args.extend(preset_args);
+            },
+            Err(e) => {
+                warn!("Failed to apply preset '{}': {}. Continuing with default settings.", preset_name, e);
+            }
+        }
     }
     
-    // Add the file or URL
+    // Apply window options if provided
+    if let Some(window) = &options.window {
+        apply_window_options(&mut args, window);
+    } else {
+        // Default behavior - add border=no
+        args.push("--border=no".to_string());
+    }
+    
+    // Add any extra arguments (these will override preset settings)
+    args.extend(options.extra_args.iter().cloned());
+    
+    // Add the file or URL as the last argument
     args.push(file_or_url.to_string());
 
     debug!("MPV arguments: {:?}", args);
 
-    // Spawn mpv asynchronously. For development, rely on the system-installed mpv.
+    // Spawn mpv asynchronously
     match Command::new("mpv").args(&args).spawn() {
         Ok(child) => {
             debug!("MPV process spawned with PID: {:?}", child.id());
@@ -150,77 +262,29 @@ pub fn spawn_mpv(file_or_url: &str, extra_args: &[&str]) -> Result<(Child, Strin
     }
 }
 
+/// Spawns mpv with the specified media file or URL.
+/// Additional command-line arguments can override default configurations.
+/// Returns the process handle and socket path for IPC communication.
+pub fn spawn_mpv_legacy(file_or_url: &str, extra_args: &[&str]) -> Result<(Child, String)> {
+    let options = SpawnOptions {
+        extra_args: extra_args.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    };
+    
+    spawn_mpv(file_or_url, &options)
+}
+
 /// Spawns mpv with the specified media file or URL and a preset.
 /// The preset will override default configurations, and extra_args can override preset settings.
 /// Returns the process handle and socket path for IPC communication.
-pub fn spawn_mpv_with_preset(file_or_url: &str, preset_name: Option<&str>, extra_args: &[&str]) -> Result<(Child, String)> {
-    info!("Launching mpv for media: {} with preset: {:?}", file_or_url, preset_name);
+pub fn spawn_mpv_with_preset_legacy(file_or_url: &str, preset_name: Option<&str>, extra_args: &[&str]) -> Result<(Child, String)> {
+    let options = SpawnOptions {
+        preset: preset_name.map(|s| s.to_string()),
+        extra_args: extra_args.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    };
     
-    // Validate configuration files before launching mpv
-    if let Err(e) = validate_config_files() {
-        warn!("Error validating config files: {}. Continuing anyway...", e);
-    }
-
-    // Generate a unique socket path for IPC
-    let socket_path = generate_socket_path();
-    debug!("Generated IPC socket path: {}", socket_path);
-
-    // Create String values that will live for the entire function
-    let config_dir_path = get_mpv_config_path();
-    let config_dir_str = config_dir_path.to_str().unwrap().to_string();
-    debug!("MPV config directory: {}", config_dir_str);
-    
-    // Build args using mpv's --option=value format
-    let mut args = Vec::<String>::new();
-    
-    // Add verbose flag to see script loading errors
-    args.push("--msg-level=all=v".to_string());
-    
-    // Add configuration directory
-    args.push(format!("--config-dir={}", config_dir_str));
-    
-    // Ensure uosc is used instead of the standard OSC
-    args.push("--osc=no".to_string());
-    args.push("--osd-bar=no".to_string());
-    args.push("--border=no".to_string());
-    
-    // Enable the JSON IPC server
-    args.push(format!("--input-ipc-server={}", socket_path));
-    
-    // If a preset is specified, add its configuration options
-    if let Some(preset_name) = preset_name {
-        match crate::presets::apply_preset(preset_name) {
-            Ok(preset_args) => {
-                debug!("Applying preset '{}' with args: {:?}", preset_name, preset_args);
-                args.extend(preset_args);
-            },
-            Err(e) => {
-                warn!("Failed to apply preset '{}': {}. Continuing with default settings.", preset_name, e);
-            }
-        }
-    }
-    
-    // Add any extra arguments (these will override preset settings)
-    for arg in extra_args {
-        args.push(arg.to_string());
-    }
-    
-    // Add the file or URL
-    args.push(file_or_url.to_string());
-
-    debug!("MPV arguments: {:?}", args);
-
-    // Spawn mpv asynchronously. For development, rely on the system-installed mpv.
-    match Command::new("mpv").args(&args).spawn() {
-        Ok(child) => {
-            debug!("MPV process spawned with PID: {:?}", child.id());
-            Ok((child, socket_path))
-        }
-        Err(e) => {
-            error!("Failed to launch mpv: {}", e);
-            Err(Error::Io(e))
-        }
-    }
+    spawn_mpv(file_or_url, &options)
 }
 
 /// Returns the path to the dedicated mpv configuration directory.

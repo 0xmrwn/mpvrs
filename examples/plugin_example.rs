@@ -1,9 +1,22 @@
 use neatflix_mpvrs::{VideoManager, PlaybackOptions, VideoEvent};
+use std::env;
 
 #[tokio::main]
 async fn main() {
     // Initialize logging
     neatflix_mpvrs::setup_logging();
+
+    // Get command line arguments
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        println!("Usage: {} <video_path> [start_time] [preset]", args[0]);
+        return;
+    }
+
+    // Parse arguments
+    let video_path = &args[1];
+    let start_time = args.get(2).and_then(|s| s.parse::<f64>().ok());
+    let preset = args.get(3).map(|s| s.to_string());
 
     // Create a video manager
     let manager = VideoManager::new();
@@ -48,13 +61,14 @@ async fn main() {
     
     // Create playback options
     let options = PlaybackOptions {
-        start_time: Some(10.0), // Start 10 seconds in
+        start_time,
+        preset,
         title: Some("Example Video".to_string()),
         ..Default::default()
     };
     
-    // Play a video (replace with your own video file)
-    let video_id = match manager.play("path/to/your/video.mp4".to_string(), options).await {
+    // Play the video
+    let video_id = match manager.play(video_path.to_string(), options).await {
         Ok(id) => {
             println!("Started video with ID: {}", id.to_string());
             id

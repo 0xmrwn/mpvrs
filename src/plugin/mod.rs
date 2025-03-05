@@ -27,6 +27,23 @@ impl VideoId {
     }
 }
 
+/// Window configuration options
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WindowOptions {
+    /// Whether to use a borderless window
+    pub borderless: bool,
+    /// Window position (x, y) relative to screen
+    pub position: Option<(i32, i32)>,
+    /// Window size (width, height)
+    pub size: Option<(u32, u32)>,
+    /// Whether to make the window always on top
+    pub always_on_top: bool,
+    /// Alpha value for window transparency (0.0-1.0)
+    pub opacity: Option<f32>,
+    /// Whether to hide window on startup
+    pub start_hidden: bool,
+}
+
 /// Options for video playback
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaybackOptions {
@@ -42,6 +59,8 @@ pub struct PlaybackOptions {
     pub report_progress: bool,
     /// Progress reporting interval in milliseconds
     pub progress_interval_ms: Option<u64>,
+    /// Window configuration options
+    pub window: Option<WindowOptions>,
 }
 
 impl Default for PlaybackOptions {
@@ -53,6 +72,7 @@ impl Default for PlaybackOptions {
             title: None,
             report_progress: true,
             progress_interval_ms: Some(1000),
+            window: None,
         }
     }
 }
@@ -153,31 +173,11 @@ impl VideoManager {
         
         // Spawn a blocking task to play the video
         tokio::task::spawn_blocking(move || {
-            // Convert options to mpv arguments
-            let mut args = Vec::new();
+            // Convert PlaybackOptions to SpawnOptions
+            let spawn_options = crate::player::process::SpawnOptions::from(&options);
             
-            // Add start time if specified
-            if let Some(start_time) = options.start_time {
-                args.push(format!("--start={}", start_time));
-            }
-            
-            // Add title if specified
-            if let Some(title) = &options.title {
-                args.push(format!("--title={}", title));
-            }
-            
-            // Extend with extra args
-            args.extend(options.extra_args.iter().cloned());
-            
-            // Convert args to &str slices
-            let args_slice: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-            
-            // Launch mpv with the specified source and args
-            let (process, socket_path) = if let Some(preset) = &options.preset {
-                crate::spawn_mpv_with_preset(&source, Some(preset), &args_slice)?
-            } else {
-                crate::spawn_mpv(&source, &args_slice)?
-            };
+            // Launch mpv with the specified source and options
+            let (process, socket_path) = crate::player::process::spawn_mpv(&source, &spawn_options)?;
             
             // Connect to mpv via IPC
             let ipc_client = crate::connect_ipc(&socket_path)?;
@@ -450,6 +450,47 @@ impl VideoManager {
                 break;
             }
         }
+    }
+    
+    /// Updates window properties for a video instance
+    pub async fn update_window(&self, id: VideoId, window: WindowOptions) -> Result<()> {
+        let instances = self.instances.clone();
+        
+        tokio::task::spawn_blocking(move || {
+            let instances = instances.lock().unwrap();
+            
+            if let Some(instance) = instances.get(&id) {
+                let mut ipc_client = instance.ipc_client.lock().unwrap();
+                
+                // Apply window properties one by one
+                if let Some((x, y)) = window.position {
+                    let pos_value = serde_json::json!(format!("{}+{}", x, y));
+                    ipc_client.set_property("window-pos", pos_value)?;
+                }
+                
+                if let Some((width, height)) = window.size {
+                    let size_value = serde_json::json!(format!("{}x{}", width, height));
+                    ipc_client.set_property("geometry", size_value)?;
+                }
+                
+                if window.always_on_top {
+                    ipc_client.set_property("ontop", serde_json::json!(true))?;
+                }
+                
+                if let Some(opacity) = window.opacity {
+                    let opacity = opacity.max(0.0).min(1.0);
+                    ipc_client.set_property("alpha", serde_json::json!(opacity))?;
+                }
+                
+                if window.start_hidden {
+                    ipc_client.set_property("window-minimized", serde_json::json!(true))?;
+                }
+                
+                Ok(())
+            } else {
+                Err(crate::Error::MpvError(format!("Video instance not found: {}", id.to_string())))
+            }
+        }).await.unwrap()
     }
 }
 
