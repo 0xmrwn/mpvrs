@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use log::{debug, error};
 
-use crate::player::ipc::MpvIpcClient;
+use crate::core::player::ipc::MpvIpcClient;
 use crate::Error;
 use crate::Result;
 

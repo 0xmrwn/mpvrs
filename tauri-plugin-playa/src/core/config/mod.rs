@@ -20,7 +20,7 @@ pub fn ensure_config_dir() -> Result<PathBuf> {
 
 /// Returns the path to the mpv configuration directory
 pub fn get_mpv_config_path() -> PathBuf {
-    crate::get_assets_path()
+    crate::core::get_assets_path()
 }
 
 /// Initializes the default configuration

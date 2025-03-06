@@ -1,4 +1,4 @@
-use crate::presets::config::{Platform, GpuVendor, SystemInfo};
+use crate::core::presets::config::{Platform, GpuVendor, SystemInfo};
 use std::process::Command;
 
 pub fn detect_system_info() -> SystemInfo {

@@ -8,10 +8,12 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use log::{debug, error};
 
-use crate::player::events::MpvEventListener;
-use crate::player::ipc::MpvIpcClient;
-use crate::Result;
-use crate::Error;
+use crate::core::player::process::{SpawnOptions, spawn_mpv};
+use crate::core::player::ipc::MpvIpcClient;
+use crate::core::player::events::MpvEventListener;
+use crate::core::config::ipc::{IpcConfig, DEFAULT_IPC_POLL_INTERVAL_MS, DEFAULT_MAX_RECONNECT_ATTEMPTS, DEFAULT_RECONNECT_DELAY_MS};
+
+use crate::{Result, Error};
 
 use std::collections::HashSet;
 use lazy_static::lazy_static;
@@ -192,6 +194,26 @@ impl Drop for VideoInstance {
     }
 }
 
+/// Detailed video information
+pub struct VideoInfo {
+    /// Path or URL of the video
+    pub path: String,
+    /// Current playback position in seconds
+    pub position: f64,
+    /// Total duration of the video in seconds
+    pub duration: f64,
+    /// Current volume (0-100)
+    pub volume: f64,
+    /// Whether playback is currently paused
+    pub is_paused: bool,
+    /// Playback speed (1.0 = normal)
+    pub speed: f64,
+    /// Whether audio is muted
+    pub is_muted: bool,
+    /// Playback position as a percentage (0-100)
+    pub percent: f64,
+}
+
 /// Represents the current playback progress of a video
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaybackProgress {
@@ -224,38 +246,35 @@ impl VideoManager {
     
     /// Plays a video from a local file or URL
     pub async fn play(&self, source: String, options: PlaybackOptions) -> Result<VideoId> {
-        let instances = self.instances.clone();
+        let instances = Arc::clone(&self.instances);
         let event_subscribers = self.event_subscribers.clone();
+        
+        // Generate a new video ID
+        let id = VideoId::new();
         
         // Spawn a blocking task to play the video
         tokio::task::spawn_blocking(move || {
-            // Convert PlaybackOptions to SpawnOptions
-            let spawn_options = crate::player::process::SpawnOptions::from(&options);
+            // Fix the spawn_options creation
+            let spawn_options = SpawnOptions::from(&options);
             
-            // Generate a unique ID for this instance
-            let id = VideoId::new();
+            // Fix the mpv spawn
+            let (mut process, socket_path) = spawn_mpv(&source, &spawn_options)?;
             
-            // Launch mpv with the specified source and options
-            let (mut process, socket_path) = crate::player::process::spawn_mpv(&source, &spawn_options)?;
-            
-            debug!("MPV process started, socket path: {}", socket_path);
-            
-            // Build an enhanced IPC config with more aggressive initial connection attempts
-            let ipc_config = if let Some(timeout) = options.connection_timeout_ms {
-                crate::config::ipc::IpcConfig::new(
-                    timeout,
-                    options.progress_interval_ms.unwrap_or(1000),
-                    true,
-                    10, // More attempts for initial connection
-                    250, // Faster retry for initial connection
+            // Fix the IpcConfig
+            let ipc_config = if options.connection_timeout_ms.is_some() {
+                IpcConfig::new(
+                    options.connection_timeout_ms.unwrap(),
+                    DEFAULT_IPC_POLL_INTERVAL_MS,  // Use default poll interval
+                    true,  // auto_reconnect
+                    DEFAULT_MAX_RECONNECT_ATTEMPTS,  // max_reconnect_attempts
+                    DEFAULT_RECONNECT_DELAY_MS  // reconnect_delay_ms
                 )
             } else {
-                crate::config::ipc::IpcConfig::default()
+                IpcConfig::default()
             };
             
-            // Connect to mpv via IPC (with retry logic handled inside connect_with_config)
-            debug!("Connecting to mpv IPC socket...");
-            let ipc_client = match crate::player::ipc::MpvIpcClient::connect_with_config(&socket_path, ipc_config.clone()) {
+            // Fix the MpvIpcClient connection
+            let ipc_client = match MpvIpcClient::connect_with_config(&socket_path, ipc_config.clone()) {
                 Ok(client) => client,
                 Err(e) => {
                     // If we can't connect, make sure to clean up the process
@@ -267,37 +286,12 @@ impl VideoManager {
             
             let ipc_client = Arc::new(Mutex::new(ipc_client));
             
-            // Create event listener if progress reporting is enabled
-            let (event_listener, event_thread) = if options.report_progress {
-                // Create a new IPC client for the event listener
-                debug!("Setting up event listener for progress reporting");
-                let event_ipc_client = match crate::player::ipc::MpvIpcClient::connect_with_config(&socket_path, ipc_config) {
-                    Ok(client) => client,
-                    Err(e) => {
-                        debug!("Failed to connect event listener to mpv IPC socket: {}", e);
-                        // Still return success, but without event listening
-                        let instance = VideoInstance {
-                            id,
-                            process,
-                            ipc_client,
-                            event_listener: None,
-                            event_thread: None,
-                            socket_path,
-                        };
-                        
-                        let mut instances = instances.lock().unwrap();
-                        instances.insert(id, instance);
-                        
-                        return Ok(id);
-                    }
-                };
-                
-                let mut listener = crate::player::events::MpvEventListener::new(event_ipc_client);
-                
-                // Start the listener
-                if let Err(e) = listener.start_listening() {
-                    debug!("Failed to start event listener: {}", e);
-                    // Continue without event listening
+            // Fix the MpvIpcClient for events
+            let event_ipc_client = match MpvIpcClient::connect_with_config(&socket_path, ipc_config) {
+                Ok(client) => client,
+                Err(e) => {
+                    debug!("Failed to connect event listener to mpv IPC socket: {}", e);
+                    // Still return success, but without event listening
                     let instance = VideoInstance {
                         id,
                         process,
@@ -312,30 +306,48 @@ impl VideoManager {
                     
                     return Ok(id);
                 }
-                
-                // Set up event forwarding
-                let video_id = id;
-                let ipc_client_clone = Arc::clone(&ipc_client);
-                let subscribers_clone = event_subscribers.clone();
-                let interval = options.progress_interval_ms.unwrap_or(1000);
-                
-                // Start event thread
-                let thread = thread::spawn(move || {
-                    Self::monitor_playback(video_id, ipc_client_clone, subscribers_clone, interval);
-                });
-                
-                (Some(listener), Some(thread))
-            } else {
-                (None, None)
             };
             
-            // Create and store the VideoInstance
+            // Fix the MpvEventListener creation
+            let mut listener = MpvEventListener::new(event_ipc_client);
+            
+            // Start the listener
+            if let Err(e) = listener.start_listening() {
+                debug!("Failed to start event listener: {}", e);
+                // Continue without event listening
+                let instance = VideoInstance {
+                    id,
+                    process,
+                    ipc_client,
+                    event_listener: None,
+                    event_thread: None,
+                    socket_path,
+                };
+                
+                let mut instances = instances.lock().unwrap();
+                instances.insert(id, instance);
+                
+                return Ok(id);
+            }
+            
+            // Set up event forwarding
+            let video_id = id;
+            let ipc_client_clone = Arc::clone(&ipc_client);
+            let subscribers_clone = event_subscribers.clone();
+            let interval = options.progress_interval_ms.unwrap_or(1000);
+            
+            // Start event thread
+            let thread = thread::spawn(move || {
+                Self::monitor_playback(video_id, ipc_client_clone, subscribers_clone, interval);
+            });
+            
+            // Store the instance with listener and thread
             let instance = VideoInstance {
                 id,
                 process,
                 ipc_client,
-                event_listener,
-                event_thread,
+                event_listener: Some(listener),
+                event_thread: Some(thread),
                 socket_path,
             };
             
@@ -858,6 +870,153 @@ impl VideoManager {
             })
         } else {
             Err(Error::MpvError(format!("No video instance found with ID: {}", id.to_string())))
+        }
+    }
+    
+    /// Pauses video playback
+    pub async fn pause(&self, id: VideoId) -> Result<()> {
+        let instances = self.instances.lock().unwrap();
+        
+        if let Some(instance) = instances.get(&id) {
+            let client = instance.ipc_client.clone();
+            let mut client_guard = client.lock().unwrap();
+            
+            client_guard.set_pause(true)?;
+            
+            // Notify subscribers
+            Self::notify_subscribers(
+                &self.event_subscribers,
+                VideoEvent::Paused { id }
+            );
+            
+            Ok(())
+        } else {
+            Err(Error::MpvError(format!("Video instance not found: {}", id.to_string())))
+        }
+    }
+    
+    /// Resumes video playback
+    pub async fn resume(&self, id: VideoId) -> Result<()> {
+        let instances = self.instances.lock().unwrap();
+        
+        if let Some(instance) = instances.get(&id) {
+            let client = instance.ipc_client.clone();
+            let mut client_guard = client.lock().unwrap();
+            
+            client_guard.set_pause(false)?;
+            
+            // Notify subscribers
+            Self::notify_subscribers(
+                &self.event_subscribers,
+                VideoEvent::Resumed { id }
+            );
+            
+            Ok(())
+        } else {
+            Err(Error::MpvError(format!("Video instance not found: {}", id.to_string())))
+        }
+    }
+    
+    /// Seeks to a specific position in the video
+    pub async fn seek(&self, id: VideoId, position: f64) -> Result<()> {
+        let instances = self.instances.lock().unwrap();
+        
+        if let Some(instance) = instances.get(&id) {
+            let client = instance.ipc_client.clone();
+            let mut client_guard = client.lock().unwrap();
+            
+            client_guard.seek(position)?;
+            
+            Ok(())
+        } else {
+            Err(Error::MpvError(format!("Video instance not found: {}", id.to_string())))
+        }
+    }
+    
+    /// Sets the volume for a video
+    pub async fn set_volume(&self, id: VideoId, volume: i32) -> Result<()> {
+        let instances = self.instances.lock().unwrap();
+        
+        if let Some(instance) = instances.get(&id) {
+            let client = instance.ipc_client.clone();
+            let mut client_guard = client.lock().unwrap();
+            
+            client_guard.set_volume(volume as f64)?;
+            
+            Ok(())
+        } else {
+            Err(Error::MpvError(format!("Video instance not found: {}", id.to_string())))
+        }
+    }
+    
+    /// Gets detailed information about a video
+    pub async fn get_video_info(&self, id: VideoId) -> Result<VideoInfo> {
+        let instances = self.instances.lock().unwrap();
+        
+        if let Some(instance) = instances.get(&id) {
+            let client = instance.ipc_client.clone();
+            let mut client_guard = client.lock().unwrap();
+            
+            // Get position
+            let position = match client_guard.get_property("playback-time") {
+                Ok(pos) => pos.as_f64().unwrap_or(0.0),
+                Err(_) => 0.0,
+            };
+            
+            // Get duration
+            let duration = match client_guard.get_property("duration") {
+                Ok(dur) => dur.as_f64().unwrap_or(0.0),
+                Err(_) => 0.0,
+            };
+            
+            // Get volume
+            let volume = match client_guard.get_property("volume") {
+                Ok(vol) => vol.as_f64().unwrap_or(100.0),
+                Err(_) => 100.0,
+            };
+            
+            // Get paused state
+            let is_paused = match client_guard.get_property("pause") {
+                Ok(paused) => paused.as_bool().unwrap_or(false),
+                Err(_) => false,
+            };
+            
+            // Get speed
+            let speed = match client_guard.get_property("speed") {
+                Ok(spd) => spd.as_f64().unwrap_or(1.0),
+                Err(_) => 1.0,
+            };
+            
+            // Get muted state
+            let is_muted = match client_guard.get_property("mute") {
+                Ok(mute) => mute.as_bool().unwrap_or(false),
+                Err(_) => false,
+            };
+            
+            // Get path
+            let path = match client_guard.get_property("path") {
+                Ok(p) => p.as_str().unwrap_or("").to_string(),
+                Err(_) => "".to_string(),
+            };
+            
+            let percent = if duration > 0.0 {
+                (position / duration) * 100.0
+            } else {
+                0.0
+            };
+            
+            Ok(VideoInfo {
+                path,
+                position,
+                duration,
+                volume,
+                is_paused,
+                speed,
+                is_muted,
+                percent,
+            })
+        } else {
+            Err(Error::MpvError(format!("Video instance not found: {}", id.to_string())))
         }
     }
 }

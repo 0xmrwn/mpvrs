@@ -1,9 +1,9 @@
 use crate::{Error, Result};
-use log::{debug, error, warn};
+use log::{debug, error};
 use serde_json::{Value, json};
 use std::io::{Write, BufRead, BufReader};
 use std::time::{Duration, Instant};
-use crate::config::ipc::IpcConfig;
+use crate::core::config::ipc::IpcConfig;
 
 #[cfg(target_family = "unix")]
 use std::os::unix::net::UnixStream;
@@ -97,14 +97,12 @@ impl MpvIpcClient {
                     Err(e) => {
                         if attempts >= max_attempts {
                             error!("Failed to connect to mpv IPC socket after {} attempts: {}", max_attempts, e);
-                            return Err(Error::Io(e));
+                            return Err(Error::Io(e.to_string()));
                         }
                         
                         debug!("Failed to connect to mpv IPC socket, retrying ({}/{}): {}", 
                                attempts + 1, max_attempts, e);
                         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                        attempts += 1;
-                        delay_ms = std::cmp::min(delay_ms * 2, 1000); // Exponential backoff, capped at 1 second
                     }
                 }
             }
@@ -128,14 +126,12 @@ impl MpvIpcClient {
                     Err(e) => {
                         if attempts >= max_attempts {
                             error!("Failed to connect to mpv IPC socket after {} attempts: {}", max_attempts, e);
-                            return Err(Error::Io(e));
+                            return Err(Error::Io(e.to_string()));
                         }
                         
                         debug!("Failed to connect to mpv IPC socket, retrying ({}/{}): {}", 
                                attempts + 1, max_attempts, e);
                         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                        attempts += 1;
-                        delay_ms = std::cmp::min(delay_ms * 2, 1000); // Exponential backoff, capped at 1 second
                     }
                 }
             }
@@ -220,7 +216,7 @@ impl MpvIpcClient {
                         }
                     }
                     
-                    return Err(Error::Io(e));
+                    return Err(Error::Io(e.to_string()));
                 }
             }
         }
@@ -245,7 +241,7 @@ impl MpvIpcClient {
                         self.intentionally_closed = true;
                     }
                     
-                    return Err(Error::Io(e));
+                    return Err(Error::Io(e.to_string()));
                 }
             }
         }
@@ -467,143 +463,79 @@ impl MpvIpcClient {
     
     /// Checks if we should attempt to reconnect based on the error
     fn should_reconnect(&mut self, error: &Error) -> bool {
-        // Always honor intentionally_closed flag
+        // Don't reconnect if auto-reconnect is disabled
+        if !self.config.auto_reconnect {
+            return false;
+        }
+        
+        // Don't reconnect if we've exhausted our reconnection attempts
+        if self.reconnect_attempts >= self.config.max_reconnect_attempts {
+            debug!("Maximum reconnection attempts ({}) reached", self.config.max_reconnect_attempts);
+            return false;
+        }
+        
+        // Don't reconnect if we've intentionally closed the connection
         if self.intentionally_closed {
-            debug!("Not reconnecting because client was intentionally closed");
             return false;
         }
-
-        // Check for common socket errors that indicate the process has terminated
-        let is_terminal_error = match error {
-            // Broken pipe typically means the process has already exited
-            Error::Io(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {
-                debug!("Detected broken pipe error, marking as intentionally closed");
-                true
+        
+        match error {
+            // Only attempt reconnection for specific I/O errors
+            Error::Io(err_str) => {
+                // Check for broken pipe, connection refused/reset
+                // We can't use ErrorKind directly since we're storing the error as a string
+                // So check for these specific error messages instead
+                if err_str.contains("broken pipe") || 
+                   err_str.contains("pipe is being closed") {
+                    debug!("Broken pipe detected, will attempt reconnection");
+                    return true;
+                } else if err_str.contains("connection refused") {
+                    debug!("Connection refused detected, will attempt reconnection");
+                    return true;
+                } else if err_str.contains("connection reset") {
+                    debug!("Connection reset detected, will attempt reconnection");
+                    return true;
+                }
+                
+                // For other IO errors, don't attempt reconnection
+                false
             },
-            
-            // Connection refused means the socket is no longer available
-            Error::Io(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
-                debug!("Detected connection refused error, marking as intentionally closed");
-                true
-            },
-            
-            // Connection reset indicates the process has terminated
-            Error::Io(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {
-                debug!("Detected connection reset error, marking as intentionally closed");
-                true
-            },
-            
-            // EOF-related errors
-            Error::MpvError(msg) if msg.contains("End of file") => {
-                debug!("Detected EOF error, marking as intentionally closed");
-                true
-            },
-            
-            // Property unavailable often happens during shutdown
-            Error::MpvError(msg) if msg.contains("property unavailable") && self.connected => {
-                debug!("Detected property unavailable error during connected state, treating as EOF");
-                true
-            },
-            
+            // For other error types, don't attempt reconnection
             _ => false,
-        };
-
-        if is_terminal_error {
-            // This is a key addition: mark as intentionally closed when terminal errors are detected
-            // because these almost always mean mpv has exited
-            self.intentionally_closed = true;
-            debug!("Not reconnecting and marking as intentionally closed because terminal error detected: {}", error);
-            return false;
         }
-
-        // Other errors might be transient, so reconnect
-        true
     }
     
     /// Sends a request to mpv with improved error handling
     fn send_request(&mut self, request: &Value) -> Result<()> {
-        // First check if the client was intentionally closed
-        if self.intentionally_closed {
-            debug!("Not sending request because client was intentionally closed");
-            return Err(Error::MpvError("Client was intentionally closed".to_string()));
-        }
-
-        // Check if the socket file exists before attempting to reconnect or send
-        #[cfg(target_family = "unix")]
-        {
-            let socket_path = std::path::Path::new(&self.socket_path);
-            if !socket_path.exists() {
-                debug!("Socket path does not exist before sending request, marking as intentionally closed");
-                self.intentionally_closed = true;
-                return Err(Error::MpvError("Socket file does not exist, mpv process has likely terminated".to_string()));
-            }
-        }
-
         if !self.connected {
-            if self.config.auto_reconnect {
-                self.reconnect()?;
-            } else {
-                return Err(Error::MpvError("Not connected to mpv".to_string()));
-            }
+            return Err(Error::MpvError("Not connected to mpv".to_string()));
         }
         
         let request_str = request.to_string();
-        debug!("Sending request: {}", request_str);
         
-        #[cfg(target_family = "unix")]
+        // Add a newline to the request
+        let request_bytes = format!("{}\n", request_str).into_bytes();
+        
+        #[cfg(target_family = "unix")] 
         {
-            match self.socket.write_all(format!("{}\n", request_str).as_bytes()) {
-                Ok(_) => {
-                    debug!("Request sent successfully");
-                    // Reset reconnect attempts on successful send
-                    self.reset_reconnect_attempts();
-                    Ok(())
-                },
+            match self.socket.write_all(&request_bytes) {
+                Ok(_) => Ok(()),
                 Err(e) => {
-                    // Only log as error if not already marked as intentionally closed
-                    if !self.intentionally_closed {
-                        error!("Failed to send request: {}", e);
-                    } else {
-                        debug!("Failed to send request to intentionally closed client: {}", e);
-                    }
-                    
-                    // Check if this is a terminal error like broken pipe
-                    if e.kind() == std::io::ErrorKind::BrokenPipe || 
-                       e.kind() == std::io::ErrorKind::ConnectionReset {
-                        debug!("Terminal error detected during send, marking as intentionally closed");
-                        self.intentionally_closed = true;
-                    }
+                    error!("Failed to send request: {}", e);
                     self.connected = false;
-                    Err(Error::Io(e))
+                    Err(Error::Io(e.to_string()))
                 }
             }
         }
         
         #[cfg(target_family = "windows")]
         {
-            match self.socket.write_all(format!("{}\n", request_str).as_bytes()) {
-                Ok(_) => {
-                    debug!("Request sent successfully");
-                    // Reset reconnect attempts on successful send
-                    self.reset_reconnect_attempts();
-                    Ok(())
-                },
+            match self.socket.write_all(&request_bytes) {
+                Ok(_) => Ok(()),
                 Err(e) => {
-                    // Only log as error if not already marked as intentionally closed
-                    if !self.intentionally_closed {
-                        error!("Failed to send request: {}", e);
-                    } else {
-                        debug!("Failed to send request to intentionally closed client: {}", e);
-                    }
-                    
-                    // Check if this is a terminal error
-                    if e.kind() == std::io::ErrorKind::BrokenPipe || 
-                       e.kind() == std::io::ErrorKind::ConnectionReset {
-                        debug!("Terminal error detected during send, marking as intentionally closed");
-                        self.intentionally_closed = true;
-                    }
+                    error!("Failed to send request: {}", e);
                     self.connected = false;
-                    Err(Error::Io(e))
+                    Err(Error::Io(e.to_string()))
                 }
             }
         }
@@ -620,66 +552,31 @@ impl MpvIpcClient {
         }
         
         let timeout = Duration::from_millis(self.config.timeout_ms);
-        let start_time = Instant::now();
+        let _start_time = Instant::now();
         
         #[cfg(target_family = "unix")]
-        let reader = BufReader::new(&self.socket);
+        let mut reader = BufReader::new(&self.socket);
         
         #[cfg(target_family = "windows")]
-        let reader = BufReader::new(&self.socket);
+        let mut reader = BufReader::new(&self.socket);
         
         // Set read timeout if available
         #[cfg(target_family = "unix")]
         {
             self.socket.set_read_timeout(Some(timeout))
-                .map_err(|e| Error::Io(e))?;
+                .map_err(|e| Error::Io(e.to_string()))?;
         }
         
-        // Read and parse lines until we find the response with matching request_id
-        let mut reader_lines = reader.lines();
-        while let Some(line_result) = reader_lines.next() {
-            // Check for timeout
-            if start_time.elapsed() > timeout {
-                return Err(Error::MpvError(format!("Response timeout after {} ms", self.config.timeout_ms)));
-            }
-            
-            match line_result {
-                Ok(line) => {
-                    debug!("Received response: {}", line);
-                    
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    
-                    match serde_json::from_str::<Value>(&line) {
-                        Ok(Value::Object(resp)) => {
-                            // Check if this is a response to our request
-                            if let Some(Value::Number(id)) = resp.get("request_id") {
-                                if id.as_u64() == Some(request_id) {
-                                    return Ok(Value::Object(resp));
-                                }
-                            }
-                            
-                            // If it's an event, ignore and continue
-                            if resp.contains_key("event") {
-                                continue;
-                            }
-                        },
-                        Ok(v) => {
-                            debug!("Received unexpected response format: {:?}", v);
-                            continue;
-                        },
-                        Err(e) => {
-                            warn!("Failed to parse response: {} - {}", line, e);
-                            continue;
-                        }
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to read response: {}", e);
-                    self.connected = false;
-                    return Err(Error::Io(e));
-                }
+        // Read the response
+        let mut response_str = String::new();
+        match reader.read_line(&mut response_str) {
+            Ok(_) => {
+                debug!("Received response: {}", response_str);
+            },
+            Err(e) => {
+                error!("Failed to read response: {}", e);
+                self.connected = false;
+                return Err(Error::Io(e.to_string()));
             }
         }
         

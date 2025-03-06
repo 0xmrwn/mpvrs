@@ -13,6 +13,7 @@ mod mobile;
 mod commands;
 mod error;
 mod models;
+pub mod core;
 
 pub use error::{Error, Result};
 
@@ -35,7 +36,13 @@ impl<R: Runtime, T: Manager<R>> crate::PlayaExt<R> for T {
 /// Initializes the plugin.
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
   Builder::new("playa")
-    .invoke_handler(tauri::generate_handler![commands::ping])
+    .invoke_handler(tauri::generate_handler![
+      commands::play,
+      commands::control,
+      commands::get_info,
+      commands::close,
+      commands::list_presets
+    ])
     .setup(|app, api| {
       #[cfg(mobile)]
       let playa = mobile::init(app, api)?;

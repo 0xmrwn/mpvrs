@@ -2,11 +2,11 @@ use crate::{Error, Result};
 use log::{debug, error, info, warn};
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use uuid::Uuid;
-use crate::player::events::MpvEventListener;
-use crate::plugin::WindowOptions;
+use crate::core::player::events::MpvEventListener;
+use crate::core::plugin::WindowOptions;
 
 /// Options for spawning mpv
 #[derive(Debug, Clone, Default)]
@@ -19,8 +19,8 @@ pub struct SpawnOptions {
     pub window: Option<WindowOptions>,
 }
 
-impl From<&crate::plugin::PlaybackOptions> for SpawnOptions {
-    fn from(options: &crate::plugin::PlaybackOptions) -> Self {
+impl From<&crate::core::plugin::PlaybackOptions> for SpawnOptions {
+    fn from(options: &crate::core::plugin::PlaybackOptions) -> Self {
         let mut extra_args = options.extra_args.clone();
         
         // Convert start_time to argument
@@ -45,7 +45,7 @@ impl From<&crate::plugin::PlaybackOptions> for SpawnOptions {
 /// like trailing spaces after boolean values
 fn validate_config_files() -> Result<()> {
     let script_opts_dir = {
-        let mut path = crate::get_assets_path();
+        let mut path = crate::core::get_assets_path();
         path.push("script-opts");
         path
     };
@@ -220,15 +220,15 @@ pub fn spawn_mpv(
     // Enable the JSON IPC server
     args.push(format!("--input-ipc-server={}", socket_path));
     
-    // Apply preset if specified
+    // Apply preset from configuration
     if let Some(preset_name) = &options.preset {
-        match crate::presets::apply_preset(preset_name) {
+        log::debug!("Applying preset: {}", preset_name);
+        match crate::core::presets::apply_preset(preset_name) {
             Ok(preset_args) => {
-                debug!("Applying preset '{}' with args: {:?}", preset_name, preset_args);
-                args.extend(preset_args);
-            },
+                args.extend(preset_args.into_iter().map(|s| s.to_string()));
+            }
             Err(e) => {
-                warn!("Failed to apply preset '{}': {}. Continuing with default settings.", preset_name, e);
+                log::warn!("Failed to apply preset '{}': {}", preset_name, e);
             }
         }
     }
@@ -253,11 +253,16 @@ pub fn spawn_mpv(
     match Command::new("mpv").args(&args).spawn() {
         Ok(child) => {
             debug!("MPV process spawned with PID: {:?}", child.id());
+            if !Path::new(&socket_path).exists() {
+                error!("Socket file not created: {}", socket_path);
+                return Err(Error::MpvError("Failed to create socket file".to_string()));
+            }
+            
             Ok((child, socket_path))
         }
         Err(e) => {
-            error!("Failed to launch mpv: {}", e);
-            Err(Error::Io(e))
+            error!("Failed to start mpv process");
+            Err(Error::Io(e.to_string()))
         }
     }
 }
@@ -289,7 +294,7 @@ pub fn spawn_mpv_with_preset_legacy(file_or_url: &str, preset_name: Option<&str>
 
 /// Returns the path to the dedicated mpv configuration directory.
 fn get_mpv_config_path() -> PathBuf {
-    crate::get_assets_path()
+    crate::core::get_assets_path()
 }
 
 /// Monitors an mpv process and handles its exit
