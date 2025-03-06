@@ -1,0 +1,254 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+Below is a detailed plan to convert your existing mpv‐based Rust crate into a Tauri v2 plugin with minimal changes to your core logic. The idea is to “wrap” your current code as an internal library (or “core”) that the plugin exposes via a set of Tauri commands and lifecycle hooks. You’ll be reorganizing your repo into the standard Tauri plugin project structure and then “gluing” your core functionality to the Tauri APIs.
+
+---
+
+## 1. Create a New Plugin Project
+
+Use the Tauri CLI to bootstrap a new plugin project. For example, if you choose the plugin name “neatflix” (you can also use “mpv-player” or similar):
+
+```bash
+npx @tauri-apps/cli plugin new neatflix
+```
+
+This will generate a folder with a structure similar to:
+
+```
+tauri-plugin-neatflix/
+├── src/
+│   ├── commands.rs
+│   ├── desktop.rs
+│   ├── error.rs
+│   ├── lib.rs
+│   ├── mobile.rs
+│   └── models.rs
+├── permissions/
+├── guest-js/
+├── Cargo.toml
+└── package.json
+```
+
+---
+
+## 2. Restructure Your Project
+
+Since you want to reuse most of your work, you’ll move your existing core code into the new plugin project. For instance:
+
+- **Move Your Core Modules:**  
+  Create a new folder (e.g., `src/core/`) and move your existing subdirectories from your crate’s `src/` (such as `config/`, `player/`, `presets/`, and even parts of your `plugin/` if they contain core logic) into it. This isolates your mpv logic from the Tauri integration code.
+
+- **Remove the Binary Entry Point:**  
+  Delete (or move) your current `src/main.rs` file since the plugin will be a library. All functionality will be exposed via commands.
+
+Your new internal structure will look like:
+
+```
+tauri-plugin-neatflix/
+├── src/
+│   ├── commands.rs         // Tauri commands (see next section)
+│   ├── core/
+│   │   ├── config/
+│   │   ├── player/
+│   │   ├── presets/
+│   │   └── plugin/         // (if you want to keep some plugin-related internals)
+│   ├── error.rs            // (adapt your error types here)
+│   ├── lib.rs              // Plugin initialization and re-exports
+│   ├── models.rs           // Shared types (VideoEvent, VideoManager, etc.)
+│   ├── desktop.rs          // (if needed for desktop-specific code)
+│   └── mobile.rs           // (if mobile support is desired)
+```
+
+Also update your `Cargo.toml` (and remove the `[[bin]]` section if present) so that the crate is now a library.
+
+---
+
+## 3. Expose Core Functionality via Commands
+
+Inside `src/commands.rs` you will define Tauri commands that wrap your core functions. For example:
+
+```rust
+// src/commands.rs
+use tauri::{command, Manager, AppHandle};
+use crate::core::player::process; // example: using spawn_mpv from your core
+use crate::core::plugin::{VideoManager, PlaybackOptions, VideoEvent};
+use std::sync::{Arc, Mutex};
+
+#[command]
+pub async fn play(video_path: String, preset: Option<String>) -> Result<String, String> {
+  // For example, convert parameters to a PlaybackOptions object:
+  let mut playback_options = PlaybackOptions::default();
+  playback_options.preset = preset;
+  
+  // Create or access a VideoManager instance (consider using app state)
+  // Here we assume that VideoManager::new() spawns mpv and sets up IPC.
+  let video_manager = VideoManager::new();
+  
+  match video_manager.play(video_path, playback_options).await {
+    Ok(video_id) => Ok(format!("Started playback with ID: {:?}", video_id)),
+    Err(e) => Err(format!("Error starting playback: {}", e)),
+  }
+}
+
+#[command]
+pub async fn close(video_id: String) -> Result<(), String> {
+  // Use your video manager to close playback
+  // ...
+  Ok(())
+}
+
+// Add additional commands (pause, subscribe to events, etc.)
+```
+
+Use Tauri’s dependency injection (with `AppHandle` or state management) to hold a global instance of your VideoManager if needed.
+
+---
+
+## 4. Implement the Plugin Initialization in lib.rs
+
+Edit your `src/lib.rs` to create the Tauri plugin. For example:
+
+```rust
+// src/lib.rs
+use tauri::{plugin::{Builder, TauriPlugin}, Runtime};
+use serde::Deserialize;
+mod commands;
+mod error;
+mod models;
+mod core; // re-export your core code as needed
+
+#[derive(Deserialize)]
+struct Config {
+  // Optional: add plugin-specific configuration, e.g., a timeout value
+  timeout: Option<usize>,
+}
+
+pub fn init<R: Runtime>() -> TauriPlugin<R, Config> {
+  Builder::<R, Config>::new("neatflix")
+    .invoke_handler(tauri::generate_handler![
+      commands::play,
+      commands::close
+      // add more commands as defined
+    ])
+    .build()
+}
+```
+
+This function registers your plugin (with the name “neatflix” – matching your configuration in `tauri.conf.json`) and exposes your commands to the webview.
+
+---
+
+## 5. Package and Integrate mpv Scripts
+
+Your project currently has an `mpv_config` directory (with OSC theme scripts and other config files). To ship these with the plugin:
+
+- **Option A: Embed as Assets**  
+  Use Rust’s `include_str!` or a crate like [`include_dir`](mdc:https:/crates.io/crates/include_dir) to embed the contents of `mpv_config/` into the binary. Then expose a function (or do it during plugin initialization) that writes these files to a temporary or app-specific directory.  
+- **Option B: Copy During Build**  
+  Write a `build.rs` script that copies the `mpv_config/mpv_scripts/` (or similar directories) into a known output directory. You can then reference these assets when spawning mpv (updating your file paths accordingly).
+
+For example, your `build.rs` might look like:
+
+```rust
+// build.rs
+use std::fs;
+use std::path::Path;
+
+fn main() {
+  // Copy the mpv_config folder into OUT_DIR so it can be bundled with the plugin
+  let out_dir = std::env::var("OUT_DIR").unwrap();
+  fs::create_dir_all(format!("{}/mpv_config", out_dir)).unwrap();
+  fs_extra::dir::copy("mpv_config", format!("{}/", out_dir), &fs_extra::dir::CopyOptions::new()).unwrap();
+}
+```
+
+Make sure to add any necessary dependencies (like `fs_extra`) to your `Cargo.toml`.
+
+---
+
+## 6. Define Permissions and JS Bindings
+
+- **Permissions:**  
+  Create permission files (e.g., in the `permissions/` directory) that declare which commands are allowed by default. For example, create a file `permissions/default.toml` that enables your `play` and `close` commands.
+
+- **JavaScript Bindings:**  
+  In the `guest-js/` folder, write a small API that uses Tauri’s invoke mechanism. For example:
+
+  ```typescript
+  // guest-js/index.ts
+  import { invoke } from '@tauri-apps/api/tauri';
+
+  export async function play(videoPath: string, preset?: string): Promise<string> {
+    return invoke('plugin:neatflix|play', { videoPath, preset });
+  }
+
+  export async function close(videoId: string): Promise<void> {
+    return invoke('plugin:neatflix|close', { videoId });
+  }
+  ```
+
+  Build/transpile this code as required so that consumers can use your JS API in their Tauri apps.
+
+---
+
+## 7. Testing and Documentation
+
+- **Integration Testing:**  
+  Use your existing example (`examples/plugin_example.rs`) as a guide to write a test Tauri application that loads your plugin and calls the exposed commands. Verify that video playback is launched, events (progress, pause/resume, shutdown, EOF) are received, and that the mpv scripts load correctly.
+
+- **Documentation:**  
+  Update your `README.md` and include a section (or update your existing `docs/tauri-integration.md`) to explain:
+  - How to integrate the plugin into a Tauri app (i.e. how to add it to `tauri.conf.json` under the `"plugins"` key).
+  - How the commands are structured.
+  - How to manage the shipped assets (mpv scripts).
+  - Any configuration options available.
+
+---
+
+## Summary of the New Directory Structure
+
+After conversion, your project might look like this:
+
+```
+tauri-plugin-neatflix/
+├── src/
+│   ├── commands.rs         // Tauri commands (play, pause, close, etc.)
+│   ├── core/               // Moved core logic from your original crate
+│   │   ├── config/
+│   │   ├── player/
+│   │   ├── presets/
+│   │   └── plugin/         // (if needed)
+│   ├── error.rs            // Error definitions (possibly reusing your existing Error)
+│   ├── lib.rs              // Plugin initialization (exposes init() function)
+│   ├── models.rs           // Shared types (VideoEvent, VideoManager, etc.)
+│   ├── desktop.rs          // Desktop-specific code (if any)
+│   └── mobile.rs           // Mobile-specific code (optional)
+├── permissions/
+│   └── default.toml        // Permissions for your commands
+├── guest-js/               // JavaScript API bindings
+│   └── index.ts            // Example JS bindings to call plugin commands
+├── mpv_config/             // (Optional) Include or embed your mpv config/scripts
+├── Cargo.toml              // Updated Cargo manifest (library crate)
+├── build.rs                // (Optional) For copying/embed assets
+└── README.md               // Documentation for integration and usage
+```
+
+---
+
+## Final Notes
+
+- **Leverage Existing Work:**  
+  Most of your core code (handling IPC, events, spawning mpv, etc.) remains unchanged and is simply moved into `src/core/`. You only add the glue code (commands, plugin initialization) on top.
+
+- **Minimal Tauri Surface:**  
+  The plugin’s public API is limited to a few commands (launch/monitor video, send events back, etc.) so that Tauri apps can integrate tightly without needing to know the internal details of your mpv control.
+
+- **Cross-Platform & Async Considerations:**  
+  Make sure that your IPC reconnection logic and event polling (which you already implemented) continue to work seamlessly within Tauri’s async context. Use Tauri’s state management to keep a long‑lived VideoManager if necessary.
+
+By following this plan, you can convert your Rust crate into a Tauri v2 plugin with minimal modifications, leveraging your existing feature-rich video player code while providing a simple interface for Tauri apps to control video playback and receive events.
+
+Feel free to ask for further clarifications on any specific step!
