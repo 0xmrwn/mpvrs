@@ -1,6 +1,6 @@
 use tauri::{
   plugin::{Builder, TauriPlugin},
-  Manager, Runtime,
+  Manager, Runtime, RunEvent,
 };
 
 pub use models::*;
@@ -50,6 +50,34 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
       let playa = desktop::init(app, api)?;
       app.manage(playa);
       Ok(())
+    })
+    .on_event(|app, event| {
+      match event {
+        RunEvent::Exit => {
+          // Clean up resources when the application exits
+          if let Some(playa) = app.try_state::<Playa<R>>() {
+            // Using try_state to avoid panicking if the state is not available
+            log::info!("Cleaning up playa plugin resources");
+            
+            // We can perform any necessary cleanup here
+            // For example, ensure all videos are closed
+            let video_manager = playa.inner().video_manager.clone();
+            
+            // Use a blocking runtime to ensure cleanup completes before app exit
+            if let Ok(rt) = tokio::runtime::Runtime::new() {
+              rt.block_on(async {
+                if let Ok(manager) = video_manager.try_lock() {
+                  // Close all videos
+                  if let Err(e) = manager.close_all().await {
+                    log::error!("Error closing videos during shutdown: {}", e);
+                  }
+                }
+              });
+            }
+          }
+        }
+        _ => {}
+      }
     })
     .build()
 }

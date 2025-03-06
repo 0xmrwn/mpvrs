@@ -1,19 +1,38 @@
-[scope.play]
-description = "Play a video file or URL"
-permissions = []
+"$schema" = "schemas/schema.json"
 
-[scope.control]
-description = "Control video playback (pause, resume, seek, etc.)"
-permissions = []
+# Define individual permissions for each command
+[[permission]]
+identifier = "allow-play"
+description = "Allows playing video files or URLs"
+commands.allow = ["play"]
 
-[scope.get_info]
-description = "Get information about a playing video"
-permissions = []
+[[permission]]
+identifier = "allow-control"
+description = "Allows controlling video playback (pause, resume, seek, etc.)"
+commands.allow = ["control"]
 
-[scope.close]
-description = "Close a video"
-permissions = []
+[[permission]]
+identifier = "allow-get-info"
+description = "Allows getting information about a playing video"
+commands.allow = ["get_info"]
 
-[scope.list_presets]
-description = "List available presets"
-permissions = []
+[[permission]]
+identifier = "allow-close"
+description = "Allows closing a video"
+commands.allow = ["close"]
+
+[[permission]]
+identifier = "allow-list-presets"
+description = "Allows listing available presets"
+commands.allow = ["list_presets"]
+
+# Define the default permission set
+[default]
+description = "Default permissions for the playa plugin"
+permissions = [
+  "allow-play",
+  "allow-control", 
+  "allow-get-info", 
+  "allow-close", 
+  "allow-list-presets"
+]

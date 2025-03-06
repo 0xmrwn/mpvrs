@@ -343,6 +343,36 @@
           "description": "Denies the play command without any pre-configured scope.",
           "type": "string",
           "const": "deny-play"
+        },
+        {
+          "description": "Default permissions for the playa plugin",
+          "type": "string",
+          "const": "default"
+        },
+        {
+          "description": "Allows playing video files or URLs",
+          "type": "string",
+          "const": "allow-play"
+        },
+        {
+          "description": "Allows controlling video playback (pause, resume, seek, etc.)",
+          "type": "string",
+          "const": "allow-control"
+        },
+        {
+          "description": "Allows getting information about a playing video",
+          "type": "string",
+          "const": "allow-get-info"
+        },
+        {
+          "description": "Allows closing a video",
+          "type": "string",
+          "const": "allow-close"
+        },
+        {
+          "description": "Allows listing available presets",
+          "type": "string",
+          "const": "allow-list-presets"
         }
       ]
     }
