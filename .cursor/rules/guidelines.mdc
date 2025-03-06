@@ -1,7 +1,7 @@
 ---
 description: Overall project guidelines
 globs: 
-alwaysApply: true
+alwaysApply: false
 ---
 Below is the refined, comprehensive guide for building a macOS‑focused Rust video player crate that uses mpv via CLI and JSON IPC with a custom Lua OSC. This crate is designed as a standalone library that spawns mpv in its own window (using mpv's default window), loads a custom configuration for stability (with overrides allowed), and handles playback controls through both the Lua OSC theme and programmatic control via JSON IPC. Integration (for example, with a Tauri app) will be done separately by calling this crate's public API.
 

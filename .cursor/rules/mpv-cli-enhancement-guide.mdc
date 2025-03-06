@@ -1,7 +1,7 @@
 ---
 description: Technical guide for enhancing mpv integration through CLI
 globs: 
-alwaysApply: true
+alwaysApply: false
 ---
 
 ## Technical Guide: Enhancing MPV Integration via CLI and JSON IPC in Rust
