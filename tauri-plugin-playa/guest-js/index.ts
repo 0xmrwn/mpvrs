@@ -5,29 +5,33 @@ export interface PlaybackOptions {
   preset?: string;
   /** Starting position in seconds */
   startTime?: number;
-  /** Volume level (0-100) */
-  volume?: number;
-  /** Whether to start in fullscreen mode */
-  fullscreen?: boolean;
   /** Additional mpv arguments */
   extraArgs?: string[];
-  /** Window options for mpv */
-  windowOptions?: WindowOptions;
+  /** Window title */
+  title?: string;
+  /** Whether to enable progress reporting */
+  reportProgress?: boolean;
+  /** Progress reporting interval in milliseconds */
+  progressIntervalMs?: number;
+  /** Window configuration options */
+  window?: WindowOptions;
+  /** Connection timeout in milliseconds */
+  connectionTimeoutMs?: number;
 }
 
 export interface WindowOptions {
-  /** Window position x coordinate */
-  x?: number;
-  /** Window position y coordinate */
-  y?: number;
-  /** Window width */
-  width?: number;
-  /** Window height */
-  height?: number;
-  /** Whether the window should be decorated */
-  decorated?: boolean;
-  /** Whether the window should be always on top */
+  /** Whether to use a borderless window */
+  borderless?: boolean;
+  /** Window position [x, y] relative to screen */
+  position?: [number, number];
+  /** Window size [width, height] */
+  size?: [number, number];
+  /** Whether to make the window always on top */
   alwaysOnTop?: boolean;
+  /** Alpha value for window transparency (0.0-1.0) */
+  opacity?: number;
+  /** Whether to hide window on startup */
+  startHidden?: boolean;
 }
 
 export interface VideoEvent {
@@ -52,10 +56,37 @@ export interface VideoEvent {
  * @returns Promise with the video ID
  */
 export async function play(path: string, options?: PlaybackOptions): Promise<string> {
+  // Convert any legacy options format to the new format
+  const normalizedOptions: PlaybackOptions = { ...options };
+  
+  // Handle backward compatibility for volume and fullscreen
+  if ('volume' in (options || {})) {
+    console.warn('The volume option in PlaybackOptions is deprecated. Use control() to set volume after playback starts.');
+  }
+  
+  if ('fullscreen' in (options || {})) {
+    console.warn('The fullscreen option in PlaybackOptions is deprecated. Use window.borderless = true and window.size = [screen.width, screen.height] instead.');
+  }
+  
+  // Handle backward compatibility for windowOptions
+  if ('windowOptions' in (options || {})) {
+    const windowOpts = (options as any).windowOptions;
+    normalizedOptions.window = {
+      borderless: windowOpts?.decorated === false,
+      position: windowOpts?.x !== undefined && windowOpts?.y !== undefined 
+        ? [windowOpts.x, windowOpts.y] 
+        : undefined,
+      size: windowOpts?.width !== undefined && windowOpts?.height !== undefined 
+        ? [windowOpts.width, windowOpts.height] 
+        : undefined,
+      alwaysOnTop: windowOpts?.alwaysOnTop,
+    };
+  }
+  
   const response = await invoke<{ videoId: string }>('plugin:playa|play', {
     request: {
       path,
-      options: options || {},
+      options: normalizedOptions || {},
     },
   });
   
